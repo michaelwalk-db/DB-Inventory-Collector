@@ -202,9 +202,9 @@ class InventoryCollector:
                 SELECT DISTINCT inventory_execution_id, execution_time, source_database
                 FROM {table_name}
                 ORDER BY execution_time DESC
-            """)
+            """).withColumn('data_type', lit(data_type))
     
-        return execution_history.withColumn('data_type', lit(data_type))
+        return execution_history
 
     def get_database_inventory_summary(self):
         # Get the latest grant executions for each database
