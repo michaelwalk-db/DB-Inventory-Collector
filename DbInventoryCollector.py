@@ -19,6 +19,14 @@ class InventoryCollector:
     OBJECT_EXECUTION_ID_PREFIX = "objects-"
 
     def __init__(self, spark, inventory_catalog, inventory_database):
+        """
+        Initialize the InventoryCollector class with the required parameters.
+
+        Args:
+            spark (SparkSession): The SparkSession instance used to execute Spark SQL queries.
+            inventory_catalog (str): The name of the catalog where the inventory tables will be stored. Must exist.
+            inventory_database (str): The name of the database where the inventory tables will be stored. Will be created if not exist.
+        """
         self.spark = spark
         self.inventory_catalog = inventory_catalog
         self.inventory_database = inventory_database
