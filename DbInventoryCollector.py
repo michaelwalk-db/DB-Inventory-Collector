@@ -330,25 +330,6 @@ class InventoryCollector:
         print(f"{datetime.now()} - Finished writing {len(processed_acl)} results for database {database_name}. {execution_id}.")
         return (execution_id, all_acl)
         
-    def scan_all_databases(self):
-        # Get the list of databases
-        databases = self.spark.sql("SHOW DATABASES").select("databaseName").collect()
-        
-        # Iterate over databases
-        for db in databases:
-            database_name = db["databaseName"]
-            print(f"Starting inventory of database {database_name}")
-            
-            # Scan database objects
-            (object_exec_id, object_df) = self.scan_database_objects(database_name)
-            print(f"Finished scanning objects for {database_name}. Execution ID: {object_exec_id}")
-            
-            # Scan database grants
-            (grant_exec_id, grant_df) = self.scan_database_grants(database_name)
-            print(f"Finished scanning grants for {database_name}. Execution ID: {grant_exec_id}")
-        
-        print("Finished scanning all databases")
-        
     def scan_all_databases(self, rescan=False):
     
         if not rescan:
