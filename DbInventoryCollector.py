@@ -1,7 +1,7 @@
 #These imports are definitely used
-from pyself.spark.sql import *
-from pyself.spark.sql.functions import *
-from pyself.spark.sql.types import StructType,StructField, StringType, IntegerType
+from pyspark.sql import *
+from pyspark.sql.functions import *
+from pyspark.sql.types import StructType,StructField, StringType, IntegerType
 import uuid
 from datetime import datetime
 
