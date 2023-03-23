@@ -51,59 +51,6 @@ class InventoryCollector:
         self.spark.sql(f'DROP DATABASE IF EXISTS {self.inventory_catdb} CASCADE')
         self.initialize()
         
-    def old_scan_database_grants(self, database_name):
-        # Create a random execution ID and get the current timestamp
-        execution_id = self.GRANT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
-        execution_time = current_timestamp()
-        start_time_python = datetime.now()
-        print(f"Start inventory of database {database_name}. Creating inventory_execution_id: {execution_id} and execution_time: {execution_time}")
-
-        # Set the current database
-        self.spark.sql(f"USE {database_name}")
-
-        # Get the list of tables and views
-        tables_and_views = self.spark.sql("SHOW TABLES").collect()
-
-        # Initialize an empty DataFrame to store GRANT statements
-        grant_statements_df = self.spark.createDataFrame([], "inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, table_name STRING, grant_statement STRING")
-
-        # Iterate over tables and views
-        for table_view in tables_and_views:
-            table_name = table_view["tableName"]
-
-            # Get privileges for the table or view
-            privileges_df = self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
-            privileges_df = privileges_df.withColumn("table_name", lit(table_name))
-            # Return Schema:
-            #[`ObjectKey`, `ObjectType`, `ActionType`, `Principal`, `grant_statement`];
-
-            # Build GRANT statements for each row in the privileges_df
-            grant_statements = privileges_df.withColumn(
-                "grant_statement",
-                concat_ws(" ",
-                    lit("GRANT"),
-                    privileges_df["ActionType"],
-                    lit(f"ON"),
-                    privileges_df["ObjectType"], 
-                    lit(f"`{database_name}.{table_name}`"),
-                    lit(f' TO `{privileges_df["Principal"]}`')
-                )
-            ).select(lit(execution_id).alias("inventory_execution_id"), execution_time.alias("execution_time"), lit(database_name).alias("source_database"), "table_name", "grant_statement")
-
-            # Add the GRANT statements to the grant_statements_df
-            grant_statements_df = grant_statements_df.union(grant_statements)
-        #End for table
-
-        end_time = datetime.now()
-        elapsed = end_time - start_time_python
-
-        print(f"Finished inventory of database {database_name}  execution_id: {execution_id}. End time {end_time}. Elapsed: {elapsed}")
-
-        # Append the GRANT statements to the grant_statements table
-        grant_statements_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.grant_statements")
-        return (execution_id, grant_statements_df)
-    #End scan
-
     def scan_database_objects(self, database_name):
         execution_id = self.OBJECT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
         execution_time = current_timestamp()

@@ -30,22 +30,24 @@ scanner.scan_all_databases(rescan=True)
 ## Scanning a specific database
 To scan a specific database for objects and grants:
 ```
-(database_name) = "example_database"
-```
-## Scan database objects
-```
-(object_exec_id, object_df) = scanner.scan_database_objects(database_name)
-```
+database_name = "example_database"
 
-## Scan database grants
-```
+# Scan database objects
+(object_exec_id, object_df) = scanner.scan_database_objects(database_name)
+
+# Scan database grants
 (grant_exec_id, grant_df) = scanner.scan_database_grants(database_name)
 ```
 
-## Inventory Data Storage
+## View summarized results
+Lists one row per database with summarized counts of scan results.
+```
+summary_df = scanner.get_database_inventory_summary()
+display(summary_df)
+```
 
 # Data Storage
-All data is stored in append-only delta tables.
+All data is stored in append-only delta tables. This means if you re-run multiple times, there will be multiple scan results. Results are indexed by a `data_type` and a `execution_id`. The `data_type`s are 'object' and 'grant' and are stored in two different tables.
 
 ## db_objects
 This table stores the inventory of database objects. Each row represents an object (table or view) in a specific database.
