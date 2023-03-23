@@ -1,15 +1,15 @@
 #These imports are definitely used
-from pyspark.sql import *
-from pyspark.sql.functions import *
-from pyspark.sql.types import StructType,StructField, StringType, IntegerType
+from pyself.spark.sql import *
+from pyself.spark.sql.functions import *
+from pyself.spark.sql.types import StructType,StructField, StringType, IntegerType
 import uuid
 from datetime import datetime
 
 #these may not used (yet)
 from os import getgrouplist
+from functools import reduce
 import requests
 import json, math
-from functools import reduce
 import concurrent.futures
 import time
 
@@ -18,7 +18,8 @@ class InventoryCollector:
     GRANT_EXECUTION_ID_PREFIX = "grants-"
     OBJECT_EXECUTION_ID_PREFIX = "objects-"
 
-    def __init__(self, inventory_catalog, inventory_database):
+    def __init__(self, spark, inventory_catalog, inventory_database):
+        self.spark = spark
         self.inventory_catalog = inventory_catalog
         self.inventory_database = inventory_database
         
@@ -33,13 +34,13 @@ class InventoryCollector:
 
     def initialize(self):
         print(f'Will save results to: {self.inventory_catdb}. {("Saving to HMS" if self.inventory_destHms else "Saving to UC Catalog")}')
-        spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
-        spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (Principal STRING, ActionType STRING, ObjectType STRING, ObjectKey STRING, inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, grant_statement STRING)')
-        spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (source_database STRING, table STRING, objectType STRING, location STRING, viewText STRING, errMsg STRING, inventory_execution_id STRING, execution_time TIMESTAMP)')
+        self.spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
+        self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (Principal STRING, ActionType STRING, ObjectType STRING, ObjectKey STRING, inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, grant_statement STRING)')
+        self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (source_database STRING, table STRING, objectType STRING, location STRING, viewText STRING, errMsg STRING, inventory_execution_id STRING, execution_time TIMESTAMP)')
     
     def resetAllData(self):
         print(f"Dropping inventory database: {self.inventory_catdb}")
-        spark.sql(f'DROP DATABASE IF EXISTS {self.inventory_catdb} CASCADE')
+        self.spark.sql(f'DROP DATABASE IF EXISTS {self.inventory_catdb} CASCADE')
         self.initialize()
         
     def old_scan_database_grants(self, database_name):
@@ -50,20 +51,20 @@ class InventoryCollector:
         print(f"Start inventory of database {database_name}. Creating inventory_execution_id: {execution_id} and execution_time: {execution_time}")
 
         # Set the current database
-        spark.sql(f"USE {database_name}")
+        self.spark.sql(f"USE {database_name}")
 
         # Get the list of tables and views
-        tables_and_views = spark.sql("SHOW TABLES").collect()
+        tables_and_views = self.spark.sql("SHOW TABLES").collect()
 
         # Initialize an empty DataFrame to store GRANT statements
-        grant_statements_df = spark.createDataFrame([], "inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, table_name STRING, grant_statement STRING")
+        grant_statements_df = self.spark.createDataFrame([], "inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, table_name STRING, grant_statement STRING")
 
         # Iterate over tables and views
         for table_view in tables_and_views:
             table_name = table_view["tableName"]
 
             # Get privileges for the table or view
-            privileges_df = spark.sql(f"SHOW GRANT ON TABLE {table_name}")
+            privileges_df = self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
             privileges_df = privileges_df.withColumn("table_name", lit(table_name))
             # Return Schema:
             #[`ObjectKey`, `ObjectType`, `ActionType`, `Principal`, `grant_statement`];
@@ -111,13 +112,13 @@ class InventoryCollector:
         ])
         object_rows = set()
 
-        tables = spark.sql(f"SHOW TABLES IN {database_name}").filter(col("isTemporary") == False).collect()
+        tables = self.spark.sql(f"SHOW TABLES IN {database_name}").filter(col("isTemporary") == False).collect()
         print(f"{database_name} has {len(tables)} objects")
 
         for table in tables:
             table_name = table.tableName
             try:
-                desc_result = spark.sql(f"DESCRIBE TABLE EXTENDED {database_name}.{table_name};")
+                desc_result = self.spark.sql(f"DESCRIBE TABLE EXTENDED {database_name}.{table_name};")
 
                 object_type = desc_result.filter('col_name = "Type"').select("data_type").collect()[-1].data_type
 
@@ -134,7 +135,7 @@ class InventoryCollector:
             print(f" TABLE: {database_name}.{table_name} -- TYPE: {object_type}")
             object_rows.add(Row(database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
 
-        object_df = spark.createDataFrame(object_rows, objTableSchema)
+        object_df = self.spark.createDataFrame(object_rows, objTableSchema)
         object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", execution_time)
 
         end_time = datetime.now()
@@ -168,7 +169,7 @@ class InventoryCollector:
         if nameOnly:
             return tableName
         else:
-            return spark.table(tableName)
+            return self.spark.table(tableName)
         
     def get_results_by_execution_id(self, execution_id, data_type=None):
         """
@@ -200,7 +201,7 @@ class InventoryCollector:
         else:
             where_clause = ""
     
-        latest_execution_id = spark.sql(f"""
+        latest_execution_id = self.spark.sql(f"""
             SELECT inventory_execution_id
             FROM (
                 SELECT inventory_execution_id, execution_time,
@@ -217,7 +218,7 @@ class InventoryCollector:
         table_name = self.get_result_table(data_type, nameOnly=True)
 
         # Group by source_database and return the last execution id for every source_database
-        latest_execution_df = spark.sql(f"""
+        latest_execution_df = self.spark.sql(f"""
             SELECT DISTINCT source_database, inventory_execution_id, execution_time
             FROM (
                 SELECT source_database, inventory_execution_id, execution_time,
@@ -242,7 +243,7 @@ class InventoryCollector:
         else:
             # Execute the SQL query for the specified data_type and return the result
             table_name = self.get_result_table(data_type, nameOnly=True)
-            execution_history = spark.sql(f"""
+            execution_history = self.spark.sql(f"""
                 SELECT DISTINCT inventory_execution_id, execution_time, source_database
                 FROM {table_name}
                 ORDER BY execution_time DESC
@@ -273,14 +274,14 @@ class InventoryCollector:
         #                                 "object_last_execution_id": "", "object_last_execution_time": ""})
     
         # Add object counts for each database
-        object_counts = spark.table(f"{self.inventory_catdb}.db_objects").groupBy("source_database", "objectType").count()
+        object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").groupBy("source_database", "objectType").count()
         object_counts = object_counts.groupBy("source_database").pivot("objectType").agg(first("count"))
         object_counts = object_counts.withColumnRenamed("source_database", "database")
         object_counts = object_counts.fillna(0)
         summary_df = summary_df.join(object_counts, on="database", how="outer")
     
         # Add grant count for each database
-        grant_count = spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("source_database").count()
+        grant_count = self.spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("source_database").count()
         grant_count = grant_count.withColumnRenamed("source_database", "database")
         grant_count = grant_count.withColumnRenamed("count", "grant_count")
         grant_count = grant_count.fillna(0)
@@ -301,11 +302,11 @@ class InventoryCollector:
         processed_acl = set()
     
         # Set the current database
-        spark.sql(f"USE {database_name}")
+        self.spark.sql(f"USE {database_name}")
 
         quotedDbName = f'`{database_name}`'
         # append the database df to the list
-        databaseGrants = ( spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
+        databaseGrants = ( self.spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
                                     .filter(col("ObjectType")=="DATABASE")
                                     .withColumn("ObjectKey", lit(quotedDbName))
                                     .withColumn("ObjectType", lit("DATABASE"))
@@ -314,14 +315,14 @@ class InventoryCollector:
         processed_acl.update(databaseGrants.collect())
 
         # Get the list of tables and views
-        tables_and_views = spark.sql(f"SHOW TABLES in {database_name}").filter(col("isTemporary") == False).collect()
+        tables_and_views = self.spark.sql(f"SHOW TABLES in {database_name}").filter(col("isTemporary") == False).collect()
     
         # Iterate over tables and views
         for table_view in tables_and_views:
             table_name = table_view["tableName"]
             table_fullname = f'`{database_name}`.`{table_view.tableName}`'
         
-            tableGrants = (spark.sql(f"SHOW GRANT ON TABLE {table_name}")
+            tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
                             .filter(col("ObjectType")=="TABLE")
                             .withColumn("ObjectKey", lit(table_fullname))
                             .withColumn("ObjectType", lit("TABLE"))
@@ -343,7 +344,7 @@ class InventoryCollector:
 
             
         # Convert the processed ACL entries into a DataFrame
-        all_acl = (spark.createDataFrame(processed_acl, ["Principal", "ActionType", "ObjectType", "ObjectKey"]).distinct()
+        all_acl = (self.spark.createDataFrame(processed_acl, ["Principal", "ActionType", "ObjectType", "ObjectKey"]).distinct()
                     .withColumn("inventory_execution_id", lit(execution_id))
                     .withColumn("execution_time", lit(execution_time))
                     .withColumn("source_database", lit(database_name)))
@@ -376,7 +377,7 @@ class InventoryCollector:
         
     def scan_all_databases(self):
         # Get the list of databases
-        databases = spark.sql("SHOW DATABASES").select("databaseName").collect()
+        databases = self.spark.sql("SHOW DATABASES").select("databaseName").collect()
         
         # Iterate over databases
         for db in databases:
@@ -409,7 +410,7 @@ class InventoryCollector:
             object_db_list = []
 
         # Get a list of all databases
-        all_databases = [db["databaseName"] for db in spark.sql("SHOW DATABASES").select("databaseName").collect()]
+        all_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
         
         for database_name in all_databases:
             # Skip databases that have already been scanned and have data in the inventory
