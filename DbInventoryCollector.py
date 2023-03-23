@@ -1,9 +1,9 @@
 #These imports are definitely used
 from pyspark.sql import *
 from pyspark.sql.functions import *
-from pyspark.sql.types import StructType,StructField, StringType, IntegerType
+from pyspark.sql.types import StructType,StructField, StringType, IntegerType, TimestampType, FloatType
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 #these may not used (yet)
 from os import getgrouplist
@@ -45,17 +45,54 @@ class InventoryCollector:
         self.spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
         self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (Principal STRING, ActionType STRING, ObjectType STRING, ObjectKey STRING, inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, grant_statement STRING)')
         self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (source_database STRING, table STRING, objectType STRING, location STRING, viewText STRING, errMsg STRING, inventory_execution_id STRING, execution_time TIMESTAMP)')
+
+        # Create execution_history table if it does not exist
+        create_exec_hist_query = f"""
+            CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.execution_history (
+                inventory_execution_id STRING,
+                execution_time TIMESTAMP,
+                source_database STRING,
+                data_type STRING,
+                time_elapsed FLOAT,
+                records_written INT
+            )
+        """
+        self.spark.sql(create_exec_hist_query)
     
     def resetAllData(self):
         print(f"Dropping inventory database: {self.inventory_catdb}")
         self.spark.sql(f'DROP DATABASE IF EXISTS {self.inventory_catdb} CASCADE')
         self.initialize()
+    
+    def write_execution_record(self, execution_id, execution_time, database_name, data_type, records_written):
+        # Define the schema for the execution_history DataFrame
+        schema = StructType([
+            StructField("inventory_execution_id", StringType(), True),
+            StructField("execution_time", TimestampType(), True),
+            StructField("source_database", StringType(), True),
+            StructField("data_type", StringType(), True),
+            StructField("time_elapsed", FloatType(), True),
+            StructField("records_written", IntegerType(), True)
+        ])
+
+        #success print
+        end_time = datetime.now()
+        time_elapsed = (end_time - execution_time).total_seconds()
+        
+        # Create a DataFrame with the provided data and schema
+        execution_record = self.spark.createDataFrame(
+            [(execution_id, execution_time, database_name, data_type, time_elapsed, records_written)],
+            schema=schema
+        )
+
+        execution_record.write.mode("append").saveAsTable(f"{self.inventory_catdb}.execution_history")
+        print(f"{end_time} - Finished {data_type.upper()} inventory of database {database_name} execution_id: {execution_id}. Elapsed: {time_elapsed}s")
+
         
     def scan_database_objects(self, database_name):
         execution_id = self.OBJECT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
-        execution_time = current_timestamp()
-        start_time_python = datetime.now()
-        print(f"Running DB Inventory for {database_name} with exec_id {execution_id} at time {start_time_python}")
+        execution_time = datetime.now()
+        print(f"{execution_time} - Start OBJECT Inventory for {database_name} with exec_id {execution_id}")
 
         objTableSchema = StructType([
             StructField("source_database", StringType(), True),
@@ -90,18 +127,94 @@ class InventoryCollector:
             print(f" TABLE: {database_name}.{table_name} -- TYPE: {object_type}")
             object_rows.add(Row(database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
 
-        object_df = self.spark.createDataFrame(object_rows, objTableSchema)
-        object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", execution_time)
+        #Create object DF and write to db_objects table
+        if len(object_rows) > 0:
+            object_df = self.spark.createDataFrame(object_rows, objTableSchema)
+            object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))        
+            object_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.db_objects")
+        else:
+            object_df = None
 
-        end_time = datetime.now()
-        elapsed = end_time - start_time_python
-
-        print(f"Finished inventory of database {database_name} execution_id: {execution_id}. End time {end_time}. Elapsed: {elapsed}")
+        #Record finished (this also prints)
+        self.write_execution_record(execution_id, execution_time, database_name, "objects", len(object_rows))
         
-        object_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.db_objects")
-
         return (execution_id, object_df)
-   
+    
+    def scan_database_grants(self, database_name):
+        # Create a random execution ID and get the current timestamp
+        execution_id = self.GRANT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
+        execution_time = datetime.now()
+        print(f"{execution_time} - Start 'grants' inventory of database {database_name}. Creating inventory_execution_id: {execution_id}")
+        processed_acl = set()
+    
+        # Set the current database
+        self.spark.sql(f"USE {database_name}")
+
+        quotedDbName = f'`{database_name}`'
+        # append the database df to the list
+        databaseGrants = ( self.spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
+                                    .filter(col("ObjectType")=="DATABASE")
+                                    .withColumn("ObjectKey", lit(quotedDbName))
+                                    .withColumn("ObjectType", lit("DATABASE"))
+                                    # .filter(col("ActionType")!="OWN")
+                            )
+        processed_acl.update(databaseGrants.collect())
+
+        # Get the list of tables and views
+        tables_and_views = self.spark.sql(f"SHOW TABLES in {database_name}").filter(col("isTemporary") == False).collect()
+    
+        # Iterate over tables and views
+        for table_view in tables_and_views:
+            table_name = table_view["tableName"]
+            table_fullname = f'`{database_name}`.`{table_view.tableName}`'
+        
+            tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
+                            .filter(col("ObjectType")=="TABLE")
+                            .withColumn("ObjectKey", lit(table_fullname))
+                            .withColumn("ObjectType", lit("TABLE"))
+                            .collect()
+                        )
+            # tableGrants Schema:
+            # Principal, ActionType, ObjectType, ObjectKey
+
+            # Add to combined list
+            processed_acl.update(tableGrants)
+        
+            
+        # If there are no grants in the database, return early
+        numGrants = len(processed_acl)
+        if numGrants > 0:
+            # Convert the processed ACL entries into a DataFrame
+            acl_df = (self.spark.createDataFrame(processed_acl, ["Principal", "ActionType", "ObjectType", "ObjectKey"]).distinct()
+                        .withColumn("inventory_execution_id", lit(execution_id))
+                        .withColumn("execution_time", lit(execution_time))
+                        .withColumn("source_database", lit(database_name)))
+
+            # Build GRANT statements for each row in the all_acl DataFrame
+            acl_df = acl_df.withColumn(
+                "grant_statement",
+                concat(
+                    lit("GRANT "),
+                    acl_df["ActionType"],
+                    lit(" ON "),
+                    acl_df["ObjectType"], 
+                    lit(" "),
+                    acl_df["ObjectKey"], 
+                    lit(' TO `'),
+                    acl_df["Principal"],
+                    lit('`'),
+                )
+            )
+
+            acl_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.grant_statements")
+            print(f"{datetime.now()} - Finished writing {len(processed_acl)} results for database {database_name}. {execution_id}.")
+        else:
+            acl_df = None
+
+        #Record finished (this also prints)
+        self.write_execution_record(execution_id, execution_time, database_name, "grants", numGrants)
+        return (execution_id, acl_df)
+
     def get_result_table(self, data_type="grants", nameOnly = False):
         """
         Get the result table based on the data_type parameter.
@@ -224,7 +337,7 @@ class InventoryCollector:
         # Join the grant and object inventory executions
         summary_df = latest_grant_executions.join(latest_object_executions, on="database", how="outer")
     
-        # # Fill in missing values
+        # Don't fill in missing values, keep as NULL
         # summary_df = summary_df.fillna({"grant_last_execution_id": "", "grant_last_execution_time": "", 
         #                                 "object_last_execution_id": "", "object_last_execution_time": ""})
     
@@ -246,89 +359,6 @@ class InventoryCollector:
         # Return the result
         return summary_df
 
-
-
-    def scan_database_grants(self, database_name):
-        # Create a random execution ID and get the current timestamp
-        execution_id = self.GRANT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
-        execution_time = current_timestamp()
-        start_time_python = datetime.now()
-        print(f"Start inventory of database {database_name}. Creating inventory_execution_id: {execution_id} and execution_time: {execution_time}")
-        processed_acl = set()
-    
-        # Set the current database
-        self.spark.sql(f"USE {database_name}")
-
-        quotedDbName = f'`{database_name}`'
-        # append the database df to the list
-        databaseGrants = ( self.spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
-                                    .filter(col("ObjectType")=="DATABASE")
-                                    .withColumn("ObjectKey", lit(quotedDbName))
-                                    .withColumn("ObjectType", lit("DATABASE"))
-                                    # .filter(col("ActionType")!="OWN")
-                            )
-        processed_acl.update(databaseGrants.collect())
-
-        # Get the list of tables and views
-        tables_and_views = self.spark.sql(f"SHOW TABLES in {database_name}").filter(col("isTemporary") == False).collect()
-    
-        # Iterate over tables and views
-        for table_view in tables_and_views:
-            table_name = table_view["tableName"]
-            table_fullname = f'`{database_name}`.`{table_view.tableName}`'
-        
-            tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
-                            .filter(col("ObjectType")=="TABLE")
-                            .withColumn("ObjectKey", lit(table_fullname))
-                            .withColumn("ObjectType", lit("TABLE"))
-                            .collect()
-                        )
-            # tableGrants Schema:
-            # Principal, ActionType, ObjectType, ObjectKey
-
-            # Add to combined list
-            processed_acl.update(tableGrants)
-        
-            
-        # If there are no grants in the database, return early
-        if len(processed_acl) == 0:
-            end_time = datetime.now()
-            elapsed = end_time - start_time_python
-            print(f"{end_time} - Finished inventory of database {database_name}. No grants found. execution_id: {execution_id}. Elapsed: {elapsed}")
-            return (execution_id, None)
-
-            
-        # Convert the processed ACL entries into a DataFrame
-        all_acl = (self.spark.createDataFrame(processed_acl, ["Principal", "ActionType", "ObjectType", "ObjectKey"]).distinct()
-                    .withColumn("inventory_execution_id", lit(execution_id))
-                    .withColumn("execution_time", lit(execution_time))
-                    .withColumn("source_database", lit(database_name)))
-
-        # Build GRANT statements for each row in the all_acl DataFrame
-        all_acl = all_acl.withColumn(
-            "grant_statement",
-            concat(
-                lit("GRANT "),
-                all_acl["ActionType"],
-                lit(" ON "),
-                all_acl["ObjectType"], 
-                lit(" "),
-                all_acl["ObjectKey"], 
-                lit(' TO `'),
-                all_acl["Principal"],
-                lit('`'),
-            )
-        )
-
-        end_time = datetime.now()
-        elapsed = end_time - start_time_python
-
-        print(f"{end_time} - Finished inventory of database {database_name}. {len(processed_acl)} acl items found. execution_id: {execution_id}. Elapsed: {elapsed}")
-
-        # Append the GRANT statements to the grant_statements table
-        all_acl.write.mode("append").saveAsTable(f"{self.inventory_catdb}.grant_statements")
-        print(f"{datetime.now()} - Finished writing {len(processed_acl)} results for database {database_name}. {execution_id}.")
-        return (execution_id, all_acl)
         
     def scan_all_databases(self, rescan=False):
     
