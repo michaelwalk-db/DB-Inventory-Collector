@@ -40,8 +40,15 @@ class InventoryCollector:
             self.inventory_catdb = f"`{self.inventory_catalog}`.`{self.inventory_database}`"
             self.inventory_destHms = False
 
+    def tryUseCatalog(self):
+        try:
+            self.spark.sql(f'USE CATALOG {self.inventory_catalog};')
+        except Exception as e:
+            pass #Probably just not on UC enabled cluster, so just ignore
+
     def initialize(self):
         print(f'Will save results to: {self.inventory_catdb}. {("Saving to HMS" if self.inventory_destHms else "Saving to UC Catalog")}')
+        self.tryUseCatalog()
         self.spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
         self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (Principal STRING, ActionType STRING, ObjectType STRING, ObjectKey STRING, inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, grant_statement STRING)')
         self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (source_database STRING, table STRING, objectType STRING, location STRING, viewText STRING, errMsg STRING, inventory_execution_id STRING, execution_time TIMESTAMP)')
@@ -104,6 +111,7 @@ class InventoryCollector:
         ])
         object_rows = set()
 
+        self.tryUseCatalog()
         tables = self.spark.sql(f"SHOW TABLES IN {database_name}").filter(col("isTemporary") == False).collect()
         print(f"{database_name} has {len(tables)} objects")
 
@@ -148,6 +156,7 @@ class InventoryCollector:
         processed_acl = set()
     
         # Set the current database
+        self.tryUseCatalog()
         self.spark.sql(f"USE {database_name}")
 
         quotedDbName = f'`{database_name}`'
@@ -237,6 +246,7 @@ class InventoryCollector:
         if nameOnly:
             return tableName
         else:
+            self.tryUseCatalog()
             return self.spark.table(tableName)
         
     def get_results_by_execution_id(self, execution_id, data_type=None):
@@ -261,7 +271,7 @@ class InventoryCollector:
         data_df = self.get_result_table(data_type)
         return data_df.filter(data_df["inventory_execution_id"] == execution_id)
 
-    def get_last_execution(self, data_type="grants", database_name=None):
+    def get_last_execution_id(self, data_type="grants", database_name=None):
         table_name = self.get_result_table(data_type, nameOnly=True)
         
         if database_name:
@@ -269,22 +279,26 @@ class InventoryCollector:
         else:
             where_clause = ""
     
-        latest_execution_id = self.spark.sql(f"""
-            SELECT inventory_execution_id
-            FROM (
-                SELECT inventory_execution_id, execution_time,
-                    ROW_NUMBER() OVER (ORDER BY execution_time DESC) as row_num
-                FROM {table_name}
-                {where_clause}
-            ) ranked_data
-            WHERE row_num = 1
-        """).collect()[0][0]
+        self.tryUseCatalog()
+        try:
+            latest_execution_id = self.spark.sql(f"""
+                SELECT inventory_execution_id
+                FROM (
+                    SELECT inventory_execution_id, execution_time,
+                        ROW_NUMBER() OVER (ORDER BY execution_time DESC) as row_num
+                    FROM {table_name}
+                    {where_clause}
+                ) ranked_data
+                WHERE row_num = 1
+            """).collect()[0][0]
+        except IndexError:
+            latest_execution_id = None
         
         return latest_execution_id
 
     def get_all_latest_executions(self, data_type="grants"):
         table_name = self.get_result_table(data_type, nameOnly=True)
-
+        self.tryUseCatalog()
         # Group by source_database and return the last execution id for every source_database
         latest_execution_df = self.spark.sql(f"""
             SELECT DISTINCT source_database, inventory_execution_id, execution_time
@@ -299,10 +313,12 @@ class InventoryCollector:
         return latest_execution_df.withColumn("data_type", lit(data_type))
         
     def get_last_results(self, *args):
-        exec_id = self.get_last_execution(*args)
+        exec_id = self.get_last_execution_id(*args)
+        if exec_id is None: return None
         return self.get_results_by_execution_id(exec_id)
 
     def get_execution_history(self, data_type=None):
+        self.tryUseCatalog()
         if data_type is None:
             # Get execution history for both grants and objects, and union the results
             grants_history = self.get_execution_history(data_type="grants")
@@ -342,26 +358,28 @@ class InventoryCollector:
         #                                 "object_last_execution_id": "", "object_last_execution_time": ""})
     
         # Add object counts for each database
-        object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").groupBy("source_database", "objectType").count()
-        object_counts = object_counts.groupBy("source_database").pivot("objectType").agg(first("count"))
-        object_counts = object_counts.withColumnRenamed("source_database", "database")
+        object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").groupBy("inventory_execution_id", "source_database", "objectType").count()
+        object_counts = object_counts.withColumnRenamed("inventory_execution_id", "object_last_execution_id")
+        object_counts = object_counts.withColumnRenamed("source_database", "database") # Needed?
+        object_counts = object_counts.groupBy("object_last_execution_id").pivot("objectType").agg(first("count"))
         object_counts = object_counts.fillna(0)
-        summary_df = summary_df.join(object_counts, on="database", how="outer")
+        summary_df = summary_df.join(object_counts, on="object_last_execution_id", how="left")
     
         # Add grant count for each database
-        grant_count = self.spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("source_database").count()
-        grant_count = grant_count.withColumnRenamed("source_database", "database")
-        grant_count = grant_count.withColumnRenamed("count", "grant_count")
-        grant_count = grant_count.fillna(0)
-        summary_df = summary_df.join(grant_count, on="database", how="outer")
-    
+        grant_counts = self.spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("inventory_execution_id", "source_database").count()
+        grant_counts = grant_counts.withColumnRenamed("source_database", "database") # Needed?
+        grant_counts = grant_counts.withColumnRenamed("count", "grant_count")
+        grant_counts = grant_counts.withColumnRenamed("inventory_execution_id", "grant_last_execution_id")
+        grant_counts = grant_counts.fillna(0)
+        summary_df = summary_df.join(grant_counts, on="grant_last_execution_id", how="left")
     
         # Return the result
         return summary_df
 
         
     def scan_all_databases(self, rescan=False):
-    
+        self.tryUseCatalog()
+
         if not rescan:
             print("First, scanning existing progress")
             # Generate exclusion list for grant_statements
@@ -395,5 +413,181 @@ class InventoryCollector:
                 print(f"Finished scanning grants for {database_name}. Execution ID: {grant_exec_id}")        
         
         print("Finished scanning all databases")
+
+    def _generate_ddl_external(self, df: DataFrame, destCatalog: str) -> DataFrame:
+        # Create a new column with the desired SQL DDL statements
+        df = df.withColumn(
+            "sql_ddl",
+            concat_ws("",
+                lit("-- Upgrade EXTERNAL table: hive_metastore."),
+                concat_ws(".",
+                    df["source_database"],
+                    df["table"],
+                    lit(f" to {destCatalog}"), 
+                    df["source_database"],
+                    df["table"]
+                ),
+                lit(f"\nCREATE TABLE {destCatalog}."), 
+                df["source_database"], lit("."), df["table"],
+                lit(" LIKE hive_metastore."),
+                df["source_database"], lit("."), df["table"],
+                lit(" COPY LOCATION;\nALTER TABLE hive_metastore."),
+                df["source_database"], lit("."), df["table"],
+                lit(f" SET TBLPROPERTIES ('upgraded_to' = '{destCatalog}."), 
+                df["source_database"], lit("."), df["table"],
+                lit("');")
+            )
+        )
+        
+        return df
+    
+    def _generate_ddl_managed(self, df: DataFrame, destCatalog: str) -> DataFrame:
+        # Create a new column with the desired SQL DDL statements
+        df = df.withColumn(
+            "sql_ddl",
+            concat_ws("",
+                lit("-- Copy MANAGED table: hive_metastore."),
+                concat_ws(".",
+                    df["source_database"],
+                    df["table"],
+                    lit(f" to {destCatalog}"), 
+                    df["source_database"],
+                    df["table"]
+                ),
+                lit(f"\nCREATE TABLE {destCatalog}."), 
+                df["source_database"], lit("."), df["table"],
+                lit(" CLONE hive_metastore."),
+                df["source_database"], lit("."), df["table"],
+                lit(";")
+            )
+        )
+        
+        return df
+    
+    def _generate_ddl_view(self, df: DataFrame, destCatalog: str) -> DataFrame:
+        # Create a new column with the desired SQL DDL statements
+        df = df.withColumn(
+            "sql_ddl",
+            concat_ws("",
+                lit("-- Recreate VIEW: hive_metastore."),
+                concat_ws(".",
+                    df["source_database"],
+                    df["table"],
+                    lit(f" to {destCatalog}"), 
+                    df["source_database"],
+                    df["table"]
+                ),
+                lit(f"\nUSE CATALOG {destCatalog};"),
+                lit(f"\nUSE DATABASE "),
+                df["source_database"],
+                lit(f";\nCREATE VIEW {destCatalog}."), 
+                df["source_database"], lit("."), df["table"],
+                lit(" AS\n"),
+                df["viewText"],
+                lit(";")
+            )
+        )
+        
+        return df
+    
+    def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str) -> DataFrame:
+        def collectSql(df, joinSep: str = '\n'):
+            sqlList = [r.sql_ddl for r in df.select('sql_ddl').collect()]
+            return joinSep.join(sqlList)
+
+        # Filter input DataFrame by objectType and generate DDL for each type
+        df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
+        df_managed = self._generate_ddl_managed(inventoryDf.filter(inventoryDf["objectType"] == "MANAGED"), destCatalog)
+        df_view = self._generate_ddl_view(inventoryDf.filter(inventoryDf["objectType"] == "VIEW"), destCatalog)
+        
+        createDbCommands = set()
+        createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
+                            for r in df_external.select('source_database').distinct().collect()])
+        createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
+                            for r in df_managed.select('source_database').distinct().collect()])
+        createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
+                            for r in df_view.select('source_database').distinct().collect()])
+        
+        allCreateDbSql = "\n".join(createDbCommands)
+        
+        combinedSql = f"""-- Databricks Unity Catalog Migration DDL Generation
+-- Automatically generated using DbInventoryCollector on {datetime.now()}
+-- Should create {len(createDbCommands)} databases
+
+-- First: set destination catalog
+"""
+        combinedSql = combinedSql + f"USE CATALOG {destCatalog};\n"
+
+        combinedSql = combinedSql + "\n--\n-- Create Destination Databases\n--\n" + allCreateDbSql
+        
+        combinedSql = combinedSql + "\n\n--\n-- Create EXTERNAL Tables first.\n--\n" + collectSql(df_external, "\n\n")
+        combinedSql = combinedSql + "\n\n--\n-- Create MANAGED tables next\n--\n" + collectSql(df_managed, "\n\n")
+        combinedSql = combinedSql + "\n\n--\n-- Create VIEWs next\n--\n" + collectSql(df_view, "\n\n")
+        
+        return combinedSql
+
+    hive_to_uc_privilege_map = {
+        ("TABLE", "SELECT"): "SELECT",
+        ("TABLE", "MODIFY"): "MODIFY",
+        ("TABLE", "READ_METADATA"): "IGNORE",
+        ("TABLE", "DENIED_SELECT"): "IGNORE",
+        ("TABLE", "OWN"): "ALTER",
+        ("DATABASE", "USAGE"): "USE_SCHEMA",
+        ("DATABASE", "CREATE"): "CREATE_TABLE",
+        ("DATABASE", "CREATE_NAMED_FUNCTION"): "CREATE_FUNCTION",
+        ("DATABASE", "SELECT"): "SELECT",
+        ("DATABASE", "MODIFY"): "SELECT",
+        ("DATABASE", "OWN"): "ALTER",
+        ("DATABASE", "READ_METADATA"): "IGNORE",
+    }
+
+    def generate_migration_grant_sql(self, df: DataFrame, dest_catalog: str) -> str:
+        if df is None:
+            return('-- The input dataframe is None. (This probably means there are no grants to migrate)')
+        
+        dfCol = df.collect()
+        if dfCol is None or len(dfCol) == 0:
+            return('-- There are no non-inherited grants to migrate')
+
+        migrated_grants = []
+        unique_principals = set()
+        unique_principal_schema_pairs = set()
+        for row in dfCol:
+            principal = row['Principal']
+            action_type = row['ActionType']
+            object_type = row['ObjectType']
+            object_key = row['ObjectKey']
+            source_database = row['source_database']
+
+            unique_principals.add(principal)
+            if object_type == "TABLE":
+                unique_principal_schema_pairs.add((principal, source_database))
+
+            new_action = hive_to_uc_privilege_map.get((object_type, action_type), None)
+
+            if new_action is None or new_action == "IGNORE":
+                continue
+            elif new_action == "ALTER":
+                #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/ownership.html
+                #ALTER <SECURABLE_TYPE> <SECURABLE_NAME> OWNER TO <PRINCIPAL>;
+                statement = f"ALTER {object_type} {object_key} OWNER TO `{principal}`;"
+            else:
+                #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/privileges.html
+                statement = f"GRANT {new_action} ON {object_type} {object_key} TO `{principal}`;"
+
+                migrated_grants.append(statement)
+
+        all_grants = [f'USE CATALOG {dest_catalog};']
+        # Generate GRANT USE CATALOG statements for unique principals
+        for principal in unique_principals:
+            all_grants.append(f"GRANT USE CATALOG ON CATALOG {dest_catalog} TO `{principal}`;")
+
+        # Generate GRANT USE SCHEMA statements for unique principal/schema pairs
+        for principal, schema in unique_principal_schema_pairs:
+            all_grants.append(f"GRANT USE SCHEMA ON SCHEMA {schema} TO `{principal}`;")
+
+        all_grants = all_grants + migrated_grants
+        return "\n".join(all_grants)
+    # End generate grant migration DDL
 
 #End of class
