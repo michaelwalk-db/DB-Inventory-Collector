@@ -493,7 +493,7 @@ class InventoryCollector:
     def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str) -> DataFrame:
         def collectSql(df, joinSep: str = '\n'):
             sqlList = [r.sql_ddl for r in df.select('sql_ddl').collect()]
-            return joinSep.join(sqlList)
+            return (len(sqlList), joinSep.join(sqlList))
 
         # Filter input DataFrame by objectType and generate DDL for each type
         df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
@@ -520,10 +520,24 @@ class InventoryCollector:
 
         combinedSql = combinedSql + "\n--\n-- Create Destination Databases\n--\n" + allCreateDbSql
         
-        combinedSql = combinedSql + "\n\n--\n-- Create EXTERNAL Tables first.\n--\n" + collectSql(df_external, "\n\n")
-        combinedSql = combinedSql + "\n\n--\n-- Create MANAGED tables next\n--\n" + collectSql(df_managed, "\n\n")
-        combinedSql = combinedSql + "\n\n--\n-- Create VIEWs next\n--\n" + collectSql(df_view, "\n\n")
+        (objectCount, objectSql) = collectSql(df_external, "\n\n")
+        if objectCount > 0:
+            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} EXTERNAL Tables.\n--\n" + objectSql
+        else:
+            combinedSql = combinedSql + "\n\n--\n-- There are zero EXTERNAL Tables \n--"
         
+        (objectCount, objectSql) = collectSql(df_managed, "\n\n")
+        if objectCount > 0:
+            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} MANAGED Tables.\n--\n" + objectSql
+        else:
+            combinedSql = combinedSql + "\n\n--\n-- There are zero MANAGED Tables \n--"
+
+        (objectCount, objectSql) = collectSql(df_view, "\n\n")
+        if objectCount > 0:
+            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} VIEWs.\n--\n" + objectSql
+        else:
+            combinedSql = combinedSql + "\n\n--\n-- There are zero VIEWs \n--"
+
         return combinedSql
 
     hive_to_uc_privilege_map = {
@@ -563,7 +577,7 @@ class InventoryCollector:
             if object_type == "TABLE":
                 unique_principal_schema_pairs.add((principal, source_database))
 
-            new_action = hive_to_uc_privilege_map.get((object_type, action_type), None)
+            new_action = self.hive_to_uc_privilege_map.get((object_type, action_type), None)
 
             if new_action is None or new_action == "IGNORE":
                 continue
