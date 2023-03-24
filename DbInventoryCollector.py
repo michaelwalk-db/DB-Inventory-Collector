@@ -580,6 +580,7 @@ class InventoryCollector:
             new_action = self.hive_to_uc_privilege_map.get((object_type, action_type), None)
 
             if new_action is None or new_action == "IGNORE":
+                print(f"Note: Skipping migration of GRANT action {new_action} on type {object_type} to {principal} -- not used in UC")
                 continue
             elif new_action == "ALTER":
                 #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/ownership.html
@@ -589,7 +590,7 @@ class InventoryCollector:
                 #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/privileges.html
                 statement = f"GRANT {new_action} ON {object_type} {object_key} TO `{principal}`;"
 
-                migrated_grants.append(statement)
+            migrated_grants.append(statement)
 
         all_grants = [f'USE CATALOG {dest_catalog};']
         # Generate GRANT USE CATALOG statements for unique principals
