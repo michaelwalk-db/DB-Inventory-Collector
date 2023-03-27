@@ -360,10 +360,9 @@ class InventoryCollector:
         # Add object counts for each database
         object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").groupBy("inventory_execution_id", "source_database", "objectType").count()
         object_counts = object_counts.withColumnRenamed("inventory_execution_id", "object_last_execution_id")
-        object_counts = object_counts.withColumnRenamed("source_database", "database") # Needed?
         object_counts = object_counts.groupBy("object_last_execution_id").pivot("objectType").agg(first("count"))
         object_counts = object_counts.fillna(0)
-        summary_df = summary_df.join(object_counts, on="object_last_execution_id", how="left")
+        summary_df = summary_df.join(object_counts, on=["object_last_execution_id"], how="left")
     
         # Add grant count for each database
         grant_counts = self.spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("inventory_execution_id", "source_database").count()
@@ -371,7 +370,7 @@ class InventoryCollector:
         grant_counts = grant_counts.withColumnRenamed("count", "grant_count")
         grant_counts = grant_counts.withColumnRenamed("inventory_execution_id", "grant_last_execution_id")
         grant_counts = grant_counts.fillna(0)
-        summary_df = summary_df.join(grant_counts, on="grant_last_execution_id", how="left")
+        summary_df = summary_df.join(grant_counts, on=["grant_last_execution_id", "database"], how="left")
     
         # Return the result
         return summary_df
@@ -427,7 +426,7 @@ class InventoryCollector:
                     df["source_database"],
                     df["table"]
                 ),
-                lit(f"\nCREATE TABLE {destCatalog}."), 
+                lit(f"\nCREATE TABLE IF NOT EXISTS {destCatalog}."), 
                 df["source_database"], lit("."), df["table"],
                 lit(" LIKE hive_metastore."),
                 df["source_database"], lit("."), df["table"],
@@ -454,7 +453,7 @@ class InventoryCollector:
                     df["source_database"],
                     df["table"]
                 ),
-                lit(f"\nCREATE TABLE {destCatalog}."), 
+                lit(f"\nCREATE TABLE IF NOT EXISTS {destCatalog}."), 
                 df["source_database"], lit("."), df["table"],
                 lit(" CLONE hive_metastore."),
                 df["source_database"], lit("."), df["table"],
@@ -480,7 +479,7 @@ class InventoryCollector:
                 lit(f"\nUSE CATALOG {destCatalog};"),
                 lit(f"\nUSE DATABASE "),
                 df["source_database"],
-                lit(f";\nCREATE VIEW {destCatalog}."), 
+                lit(f";\nCREATE VIEW  IF NOT EXISTS {destCatalog}."), 
                 df["source_database"], lit("."), df["table"],
                 lit(" AS\n"),
                 df["viewText"],
@@ -580,7 +579,7 @@ class InventoryCollector:
             new_action = self.hive_to_uc_privilege_map.get((object_type, action_type), None)
 
             if new_action is None or new_action == "IGNORE":
-                print(f"Note: Skipping migration of GRANT action {new_action} on type {object_type} to {principal} -- not used in UC")
+                print(f"Note: Skipping migration of GRANT action {action_type} on type {object_type} to {principal} -- not used in UC")
                 continue
             elif new_action == "ALTER":
                 #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/ownership.html
