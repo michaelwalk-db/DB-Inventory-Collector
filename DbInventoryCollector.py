@@ -15,8 +15,9 @@ import time
 
 
 class InventoryCollector:
-    GRANT_EXECUTION_ID_PREFIX = "grants-"
     OBJECT_EXECUTION_ID_PREFIX = "objects-"
+    GRANT_EXECUTION_ID_PREFIX = "grants-"
+    FUNCTION_EXECUTION_ID_PREFIX = "func_meta-"
 
     def __init__(self, spark, inventory_catalog, inventory_database):
         """
@@ -31,10 +32,8 @@ class InventoryCollector:
         self.inventory_catalog = inventory_catalog
         self.inventory_database = inventory_database
         
-        
         if self.inventory_catalog == 'hive_metastore':
-            # Assume we've not using UC yet, OR already issued USE CATALOG hive_metastore
-            self.inventory_catdb = f"`{self.inventory_database}`"
+            self.inventory_catdb = f"`{self.inventory_database}`" #Will have to rely on tryUse Catalog to ensure this works
             self.inventory_destHms = True
         else:
             self.inventory_catdb = f"`{self.inventory_catalog}`.`{self.inventory_database}`"
@@ -223,6 +222,47 @@ class InventoryCollector:
         #Record finished (this also prints)
         self.write_execution_record(execution_id, execution_time, database_name, "grants", numGrants)
         return (execution_id, acl_df)
+
+    def scan_catalog_functions(self, scan_catalog = 'hive_metastore'):
+        def list_functions(catalogName, databaseName):
+            functions = self.spark.sql(f"SHOW FUNCTIONS IN `{catalogName}`.`{databaseName}`").filter(col("function").startswith(f"{catalogName}.{databaseName}"))
+            return functions
+
+        def describe_function_extended(functionNameFull):
+            result = self.spark.sql(f"DESCRIBE FUNCTION EXTENDED {functionNameFull}")
+            result_str = "\n".join([row["function_desc"] for row in result.collect()])
+            return result_str
+
+        execution_id = self.FUNCTION_EXECUTION_ID_PREFIX + str(uuid.uuid4())
+        execution_time = datetime.now()
+        print(f"{execution_time} - Start 'functions' inventory of catalog {scan_catalog}. Creating inventory_execution_id: {execution_id}")
+
+        # Create an empty DataFrame to store the results
+        schema = "source_catalog STRING, source_database STRING, function_name_full STRING, function_desc STRING"
+        results_df = self.spark.createDataFrame([], schema)
+
+        scan_catalog = 'hive_metastore'
+        self.spark.sql(f'use catalog {scan_catalog}')
+
+        for db in self.spark.sql(f"SHOW DATABASES").collect():
+            funcs = list_functions(scan_catalog, db.databaseName).collect()
+            funcCount = len(funcs)
+            if funcCount > 0: 
+                print(f"{db.databaseName} has {funcCount} functions")
+                for func in funcs:
+                    function_name = func["function"]
+                    describe_result = describe_function_extended(function_name)
+                    row = (scan_catalog, db.databaseName, function_name, describe_result)
+                    print(function_name)
+                    print(describe_result)
+
+                    # Add the result to the results DataFrame
+                    results_df = results_df.union(self.spark.createDataFrame([row], schema))
+
+        # Save the results to a Delta table
+        results_df = results_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))
+        results_df.write.format("delta").mode("append").saveAsTable(f"{self.inventory_catdb}.db_functions")
+        return results_df
 
     def get_result_table(self, data_type="grants", nameOnly = False):
         """
@@ -455,7 +495,7 @@ class InventoryCollector:
                 ),
                 lit(f"\nCREATE TABLE IF NOT EXISTS {destCatalog}."), 
                 df["source_database"], lit("."), df["table"],
-                lit(" CLONE hive_metastore."),
+                lit(" DEEP CLONE hive_metastore."),
                 df["source_database"], lit("."), df["table"],
                 lit(";")
             )
@@ -489,57 +529,128 @@ class InventoryCollector:
         
         return df
     
-    def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str) -> DataFrame:
+    # TODO: Add call out for external locations referenced
+    # https://docs.databricks.com/data-governance/unity-catalog/manage-external-locations-and-credentials.html#manage-external-locations&language-sql
+
+    def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str, includeManaged = True) -> DataFrame:
         def collectSql(df, joinSep: str = '\n'):
             sqlList = [r.sql_ddl for r in df.select('sql_ddl').collect()]
             return (len(sqlList), joinSep.join(sqlList))
 
-        # Filter input DataFrame by objectType and generate DDL for each type
-        df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
-        df_managed = self._generate_ddl_managed(inventoryDf.filter(inventoryDf["objectType"] == "MANAGED"), destCatalog)
-        df_view = self._generate_ddl_view(inventoryDf.filter(inventoryDf["objectType"] == "VIEW"), destCatalog)
-        
+        print(f"Generating Object DDL to migrate from catalog hive_metastore to {destCatalog}")
+        if includeManaged:
+            print("Attention: Managed tables are INCLUDED. This will COPY the data.")
+        else:
+            print("Attention: Managed tables are EXCLUDED. View creation may fail.")
+
+        # Filter input DataFrame by objectType and generate DDL for each type        
         createDbCommands = set()
+
+        # First, complain about error objects we're not generating a DDL for
+        error_df = inventoryDf.filter(inventoryDf["objectType"] == "ERROR")
+        error_messages = [] #for output
+        for row in error_df.collect():
+            source_db = row["source_database"]
+            table_name = row["table"]
+            try:
+                error_message = row["errMsg"].strip()
+                if error_message:
+                    first_line_error = error_message.split('\n')[0]
+                else:
+                    first_line_error = "Error message is empty or not available"
+            except Exception as e:
+                first_line_error = "Exception retrieving message"
+            error_messages.append(f"-- ERROR: Error retrieving information for object in the source database '{source_db}' and table '{table_name}'.\n--        Error Message (1st line): {first_line_error}")            
+
+        #Generate DDLs for non-error object types
+        df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
+        if includeManaged:
+            df_managed = self._generate_ddl_managed(inventoryDf.filter(inventoryDf["objectType"] == "MANAGED"), destCatalog)
+        df_view = self._generate_ddl_view(inventoryDf.filter(inventoryDf["objectType"] == "VIEW"), destCatalog)
+
+        #Generate extra commands just for database creation by scanning generated DDL
         createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
                             for r in df_external.select('source_database').distinct().collect()])
-        createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
-                            for r in df_managed.select('source_database').distinct().collect()])
+        if includeManaged:
+            createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
+                                for r in df_managed.select('source_database').distinct().collect()])
         createDbCommands.update([f"CREATE DATABASE IF NOT EXISTS {r.source_database};" 
                             for r in df_view.select('source_database').distinct().collect()])
         
         allCreateDbSql = "\n".join(createDbCommands)
         
+        #Collect all SQL results here so we have the counts.
+        (externalCount, externalSql) = collectSql(df_external, "\n\n")
+        
+        if includeManaged:
+            (managedCount, managedSql) = collectSql(df_managed, "\n\n")
+        else:
+            (managedCount, managedSql) = (0, "")
+        
+        (viewCount, viewSql) = collectSql(df_view, "\n\n")
+        errorCount = len(error_messages)
+
+        #Start creating main block of SQL
         combinedSql = f"""-- Databricks Unity Catalog Migration DDL Generation
 -- Automatically generated using DbInventoryCollector on {datetime.now()}
--- Should create {len(createDbCommands)} databases
-
--- First: set destination catalog
+-- Generation Counts:
+-- Databases: {len(createDbCommands)}
+-- External Tables: {externalCount}
+-- Managed Tables: {managedCount}
+-- Views: {viewCount}
+-- Errors: {errorCount} (Number of tables DDL generation skipped due to inventory error)
 """
-        combinedSql = combinedSql + f"USE CATALOG {destCatalog};\n"
+        if errorCount > 0:
+            combinedSql = combinedSql + "-- ERROR! Some tables were unable to have DDL generated due to erros during the inventory step. Error Listing:\n" + "\n".join(error_messages)
+
+        combinedSql = combinedSql + f"\n--\n-- Set destination catalog\n--\nUSE CATALOG {destCatalog};\n"
 
         combinedSql = combinedSql + "\n--\n-- Create Destination Databases\n--\n" + allCreateDbSql
         
-        (objectCount, objectSql) = collectSql(df_external, "\n\n")
-        if objectCount > 0:
-            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} EXTERNAL Tables.\n--\n" + objectSql
+        (externalCount, externalSql) = collectSql(df_external, "\n\n")
+        if externalCount > 0:
+            combinedSql = combinedSql + f"\n\n--\n-- Create {externalCount} EXTERNAL Tables.\n--\n" + externalSql
         else:
             combinedSql = combinedSql + "\n\n--\n-- There are zero EXTERNAL Tables \n--"
         
-        (objectCount, objectSql) = collectSql(df_managed, "\n\n")
-        if objectCount > 0:
-            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} MANAGED Tables.\n--\n" + objectSql
-        else:
-            combinedSql = combinedSql + "\n\n--\n-- There are zero MANAGED Tables \n--"
+        if includeManaged:
+            if managedCount > 0:
+                combinedSql = combinedSql + f"\n\n--\n-- Create {managedCount} MANAGED Tables.\n--\n" + managedSql
+            else:
+                combinedSql = combinedSql + "\n\n--\n-- There are zero MANAGED Tables \n--"
 
-        (objectCount, objectSql) = collectSql(df_view, "\n\n")
-        if objectCount > 0:
-            combinedSql = combinedSql + f"\n\n--\n-- Create {objectCount} VIEWs.\n--\n" + objectSql
+        if viewCount > 0:
+            combinedSql = combinedSql + f"\n\n--\n-- Create {viewCount} VIEWs.\n--\n" + viewSql
         else:
             combinedSql = combinedSql + "\n\n--\n-- There are zero VIEWs \n--"
 
         return combinedSql
 
+    # UC Priviledge Docs: https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/privileges.html
+    # UC Priviledge listing:
+    #   Direct Catalog Priviledges: ALL PRIVILEGES, CREATE SCHEMA, USE CATALOG
+    #   Cascading Catalog Priviledges: CREATE FUNCTION, CREATE TABLE, USE SCHEMA, EXECUTE, MODIFY, SELECT
+    #   Direct Schema Priviledges: ALL PRIVILEGES, CREATE FUNCTION, CREATE TABLE, USE SCHEMA
+    #   Cascading Schema Priviledges: EXECUTE, MODIFY, SELECT
+    #   Table Priviledges: ALL PRIVILEGES, SELECT, MODIFY
+    #   View Priviledges: ALL PRIVILEGES, SELECT
+    #   Function Priviledges: ALL PRIVILEGES, EXECUTE
+    #   External Location: ALL PRIVILEGES, CREATE EXTERNAL TABLE, READ FILES, WRITE FILES, CREATE MANAGED STORAGE
+
+    # HIVE:
+    # Docs: https://docs.databricks.com/sql/language-manual/sql-ref-privileges-hms.html
+    # SELECT: gives read access to an object. Doubles as execute
+    # CREATE: gives ability to create an object (for example, a table in a schema).
+    # MODIFY: gives ability to add, delete, and modify data to or from an object.
+    # USAGE: does not give any abilities, but is an additional requirement to perform any action on a schema object.
+    # READ_METADATA: gives ability to view an object and its metadata.
+    # CREATE_NAMED_FUNCTION: gives ability to create a named UDF in an existing catalog or schema.
+    # MODIFY_CLASSPATH: gives ability to add files to the Spark class path.
+    # ALL PRIVILEGES: gives all privileges (is translated into all the above privileges).
+
+    #This dict takes the above comment's worth of explanations into a map between hive priviledge and unity catalog priviledge
     hive_to_uc_privilege_map = {
+        ("FUNCTION", "SELECT"): "EXECUTE",
         ("TABLE", "SELECT"): "SELECT",
         ("TABLE", "MODIFY"): "MODIFY",
         ("TABLE", "READ_METADATA"): "IGNORE",
@@ -604,4 +715,56 @@ class InventoryCollector:
         return "\n".join(all_grants)
     # End generate grant migration DDL
 
+    
+    def generate_migration_ddl(self, whichDatabase, destCatalog, forceRescan = False):
+
+        #Pull object Data & Generate
+        objectDF = None if forceRescan else self.get_last_results('objects', whichDatabase);
+        if objectDF is None:
+            _, objectDF = self.scan_database_objects(whichDatabase)
+
+        if objectDF is not None:
+            ddl_object = self.generate_migration_object_sql(objectDF, destCatalog)
+        else:
+            print("WARNING: No Objects to generate DDL for")
+            ddl_object is None
+
+        #Pull Grant Data & Generate
+        grantDF = None if forceRescan else self.get_last_results('grants', whichDatabase)
+        if grantDF is None:
+            _, grantDF = self.scan_database_grants(whichDatabase)
+
+        if grantDF is not None:
+            print(f"Generating Grant DDL to migrate from hive_metastore.{whichDatabase} to {destCatalog}.{whichDatabase}")
+            ddl_grants = self.generate_migration_grant_sql(grantDF, destCatalog)
+        else:
+            print("WARNING: No Grants to generate DDL for")
+            ddl_grants is None
+
+        #Convert to arrays for easier execution / printing
+        ddl_object = self.split_sql_to_list(ddl_object)
+        ddl_grants = self.split_sql_to_list(ddl_grants)
+
+        return (ddl_object, ddl_grants)
+
+    @staticmethod
+    def split_sql_to_list(sqlList):
+        if sqlList is None:
+            return None
+        return [s.strip() for s in sqlList.split(';')]
+
+    @staticmethod
+    def strip_sql_comments(sqlStatement):
+        return '\n'.join([x.strip() for x in sqlStatement.split('\n') if not x.strip().startswith('--') and x.strip()])
+
+    def execute_sql_list(self, sql_list, echo=True):
+        for statementRaw in self.ddl_object_array:
+            if statementRaw == '': continue
+            statementClean = self.strip_sql_comments(statementRaw)
+            if statementClean == '': continue           
+            if echo: print(f"Executing SQL:\n{statementClean}\n")
+            try:
+                self.spark.sql(statementClean)
+            except Exception as e:
+                print(e)
 #End of class
