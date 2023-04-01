@@ -1,20 +1,62 @@
-#These imports are definitely used
+# Start of DbInventoryCollector.py
+# Manually copy this entire file into a single databricks notebook cell
+
+# These imports are used
 from pyspark.sql import *
 from pyspark.sql.functions import *
 from pyspark.sql.types import StructType,StructField, StringType, IntegerType, TimestampType, FloatType
 import uuid
 from datetime import datetime, timedelta
 
-#these may not used (yet)
-from os import getgrouplist
+# Unused imports but saving for future reference
 from functools import reduce
-import requests
-import json, math
 import concurrent.futures
 import time
 
-
+# Inventory Collector Class -- Holds all functions in this file for an easy import statement
 class InventoryCollector:
+    @staticmethod
+    def CreateWidgets(dbutils, spark, reset = False):
+        if reset:
+            dbutils.widgets.removeAll()
+
+        allCatalogs = ['hive_metastore']
+        try:
+            catQueryResult = [r.catalog for r in spark.sql('show CATALOGS').collect()]
+            if len(catQueryResult) == 1 and catQueryResult[0] == spark_catalog:
+                print("WARNING: Not connected to a Unity Catalog Cluster.")
+            allCatalogs = allCatalogs + [r.catalog for r in spark.sql('show CATALOGS').collect()]
+        except Exception as e:
+            print("Unexpected error retrieving catalog listing.")
+            print(e)
+
+        dbutils.widgets.dropdown("Scan_Catalog", 'hive_metastore', allCatalogs, "Scan Catalog")
+
+        # print("\n*********************************\nCatalog list:")
+        # print('\n'.join(allCatalogs))
+
+        selectedCatalog = dbutils.widgets.get("Scan_Catalog")
+
+        try:
+            spark.sql(f'use catalog {selectedCatalog};')
+        except Exception as e:
+            if selectedCatalog == "hive_metastore":
+                pass
+            else:
+                raise e
+
+        scanCatalogDbList = [row.databaseName for row in spark.sql('show databases').select('databaseName').collect()]
+        if len('hmsDatabaseList') > 1024:
+            print('Warning! More than 1024 HMS databases. Picker widget will only display first 1024')
+        dbutils.widgets.dropdown("Scan_Database", scanCatalogDbList[0], scanCatalogDbList[0:1023], "Scan Database")
+        dbutils.widgets.text("Inventory_Catalog",   "hive_metastore", "Write Catalog for Inventory")
+        dbutils.widgets.text("Inventory_Database",   "databricks_inventory", "Write Database for Inventory")
+        dbutils.widgets.text("Migration_Catalog", "ChangeMeToDest", "Migration Destination Catalog")
+
+        print(f"Database list for Catalog {selectedCatalog}:\n")
+        print('\n'.join(scanCatalogDbList))
+
+
     OBJECT_EXECUTION_ID_PREFIX = "objects-"
     GRANT_EXECUTION_ID_PREFIX = "grants-"
     FUNCTION_EXECUTION_ID_PREFIX = "func_meta-"
@@ -39,24 +81,58 @@ class InventoryCollector:
             self.inventory_catdb = f"`{self.inventory_catalog}`.`{self.inventory_database}`"
             self.inventory_destHms = False
 
-    def tryUseCatalog(self):
-        try:
-            self.spark.sql(f'USE CATALOG {self.inventory_catalog};')
-        except Exception as e:
-            pass #Probably just not on UC enabled cluster, so just ignore
+    def setCatalog(self, catalogName):
+        if catalogName == 'hive_metastore':
+            try:
+                self.spark.sql(f'USE CATALOG {catalogName};')
+            except Exception as e:
+                pass #Probably just not on UC enabled cluster, so just ignore
+        else:
+            #No try, this is important
+            self.spark.sql(f'USE CATALOG {catalogName};')
+            
+    def setStorageCatalog(self):
+        self.setCatalog(self.inventory_catalog)
 
     def initialize(self):
         print(f'Will save results to: {self.inventory_catdb}. {("Saving to HMS" if self.inventory_destHms else "Saving to UC Catalog")}')
-        self.tryUseCatalog()
+        self.setStorageCatalog()
         self.spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
-        self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (Principal STRING, ActionType STRING, ObjectType STRING, ObjectKey STRING, inventory_execution_id STRING, execution_time TIMESTAMP, source_database STRING, grant_statement STRING)')
-        self.spark.sql(f'CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (source_database STRING, table STRING, objectType STRING, location STRING, viewText STRING, errMsg STRING, inventory_execution_id STRING, execution_time TIMESTAMP)')
+
+        self.spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.grant_statements (
+                Principal STRING,
+                ActionType STRING,
+                ObjectType STRING,
+                ObjectKey STRING,
+                inventory_execution_id STRING,
+                execution_time TIMESTAMP,
+                source_catalog STRING,
+                source_database STRING,
+                grant_statement STRING
+            )
+        """)
+
+        self.spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.db_objects (
+                source_catalog STRING,
+                source_database STRING,
+                table STRING,
+                objectType STRING,
+                location STRING,
+                viewText STRING,
+                errMsg STRING,
+                inventory_execution_id STRING,
+                execution_time TIMESTAMP
+            )
+        """)
 
         # Create execution_history table if it does not exist
         create_exec_hist_query = f"""
             CREATE TABLE IF NOT EXISTS {self.inventory_catdb}.execution_history (
                 inventory_execution_id STRING,
                 execution_time TIMESTAMP,
+                source_catalog STRING,
                 source_database STRING,
                 data_type STRING,
                 time_elapsed FLOAT,
@@ -65,16 +141,53 @@ class InventoryCollector:
         """
         self.spark.sql(create_exec_hist_query)
     
+    def migrate_storage_add_catalog(self):
+        self.spark.sql(f"""
+            ALTER TABLE {self.inventory_catdb}.grant_statements
+            ADD COLUMN source_catalog STRING
+        """)
+
+        self.spark.sql(f"""
+            UPDATE {self.inventory_catdb}.grant_statements
+            SET source_catalog = 'hive_metastore'
+            WHERE source_catalog IS NULL
+        """)
+
+        self.spark.sql(f"""
+            ALTER TABLE {self.inventory_catdb}.db_objects
+            ADD COLUMN source_catalog STRING 
+        """)
+
+        self.spark.sql(f"""
+            UPDATE {self.inventory_catdb}.db_objects
+            SET source_catalog = 'hive_metastore'
+            WHERE source_catalog IS NULL
+        """)
+
+
+        self.spark.sql(f"""
+            ALTER TABLE {self.inventory_catdb}.execution_history
+            ADD COLUMN source_catalog STRING 
+        """)
+
+        self.spark.sql(f"""
+            UPDATE {self.inventory_catdb}.execution_history
+            SET source_catalog = 'hive_metastore'
+            WHERE source_catalog IS NULL
+        """)
+
+    
     def resetAllData(self):
         print(f"Dropping inventory database: {self.inventory_catdb}")
         self.spark.sql(f'DROP DATABASE IF EXISTS {self.inventory_catdb} CASCADE')
         self.initialize()
     
-    def write_execution_record(self, execution_id, execution_time, database_name, data_type, records_written):
+    def write_execution_record(self, execution_id, execution_time, catalog_name, database_name, data_type, records_written):
         # Define the schema for the execution_history DataFrame
         schema = StructType([
             StructField("inventory_execution_id", StringType(), True),
             StructField("execution_time", TimestampType(), True),
+            StructField("source_catalog", StringType(), True),
             StructField("source_database", StringType(), True),
             StructField("data_type", StringType(), True),
             StructField("time_elapsed", FloatType(), True),
@@ -87,20 +200,21 @@ class InventoryCollector:
         
         # Create a DataFrame with the provided data and schema
         execution_record = self.spark.createDataFrame(
-            [(execution_id, execution_time, database_name, data_type, time_elapsed, records_written)],
+            [(execution_id, execution_time, catalog_name, database_name, data_type, time_elapsed, records_written)],
             schema=schema
         )
-
+        self.setStorageCatalog()
         execution_record.write.mode("append").saveAsTable(f"{self.inventory_catdb}.execution_history")
-        print(f"{end_time} - Finished {data_type.upper()} inventory of database {database_name} execution_id: {execution_id}. Elapsed: {time_elapsed}s")
+        print(f"{end_time} - Finished {data_type.upper()} inventory of database {catalog_name}.{database_name} execution_id: {execution_id}. Elapsed: {time_elapsed}s")
 
         
-    def scan_database_objects(self, database_name):
+    def scan_database_objects(self, scanCatalog, database_name):
         execution_id = self.OBJECT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
         execution_time = datetime.now()
         print(f"{execution_time} - Start OBJECT Inventory for {database_name} with exec_id {execution_id}")
 
         objTableSchema = StructType([
+            StructField("source_catalog", StringType(), True),
             StructField("source_database", StringType(), True),
             StructField("table", StringType(), True),
             StructField("objectType", StringType(), True),
@@ -110,7 +224,8 @@ class InventoryCollector:
         ])
         object_rows = set()
 
-        self.tryUseCatalog()
+        self.setCatalog(scanCatalog)
+        
         tables = self.spark.sql(f"SHOW TABLES IN {database_name}").filter(col("isTemporary") == False).collect()
         print(f"{database_name} has {len(tables)} objects")
 
@@ -128,26 +243,27 @@ class InventoryCollector:
 
             except Exception as e2:
                 print(f" TABLE: {database_name}.{table_name} -- ERROR RETRIEVING DETAILS:\nERROR MSG: {str(e2)}")
-                object_rows.add(Row(database=database_name, table=table_name, objectType="ERROR", location=None, viewText=None, errMsg=str(e2)))
+                object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType="ERROR", location=None, viewText=None, errMsg=str(e2)))
                 continue
 
             print(f" TABLE: {database_name}.{table_name} -- TYPE: {object_type}")
-            object_rows.add(Row(database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
+            object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
 
         #Create object DF and write to db_objects table
         if len(object_rows) > 0:
             object_df = self.spark.createDataFrame(object_rows, objTableSchema)
             object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))        
+            self.setStorageCatalog()
             object_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.db_objects")
         else:
             object_df = None
 
         #Record finished (this also prints)
-        self.write_execution_record(execution_id, execution_time, database_name, "objects", len(object_rows))
+        self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "objects", len(object_rows))
         
         return (execution_id, object_df)
     
-    def scan_database_grants(self, database_name):
+    def scan_database_grants(self, scanCatalog, database_name):
         # Create a random execution ID and get the current timestamp
         execution_id = self.GRANT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
         execution_time = datetime.now()
@@ -155,7 +271,7 @@ class InventoryCollector:
         processed_acl = set()
     
         # Set the current database
-        self.tryUseCatalog()
+        self.setCatalog(scanCatalog)
         self.spark.sql(f"USE {database_name}")
 
         quotedDbName = f'`{database_name}`'
@@ -196,7 +312,8 @@ class InventoryCollector:
             acl_df = (self.spark.createDataFrame(processed_acl, ["Principal", "ActionType", "ObjectType", "ObjectKey"]).distinct()
                         .withColumn("inventory_execution_id", lit(execution_id))
                         .withColumn("execution_time", lit(execution_time))
-                        .withColumn("source_database", lit(database_name)))
+                        .withColumn("source_database", lit(database_name))
+                        .withColumn("source_catalog", lit(scanCatalog)))
 
             # Build GRANT statements for each row in the all_acl DataFrame
             acl_df = acl_df.withColumn(
@@ -214,16 +331,17 @@ class InventoryCollector:
                 )
             )
 
+            self.setStorageCatalog()
             acl_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.grant_statements")
             print(f"{datetime.now()} - Finished writing {len(processed_acl)} results for database {database_name}. {execution_id}.")
         else:
             acl_df = None
 
         #Record finished (this also prints)
-        self.write_execution_record(execution_id, execution_time, database_name, "grants", numGrants)
+        self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "grants", numGrants)
         return (execution_id, acl_df)
 
-    def scan_catalog_functions(self, scan_catalog = 'hive_metastore'):
+    def scan_catalog_functions(self, scan_catalog):
         def list_functions(catalogName, databaseName):
             functions = self.spark.sql(f"SHOW FUNCTIONS IN `{catalogName}`.`{databaseName}`").filter(col("function").startswith(f"{catalogName}.{databaseName}"))
             return functions
@@ -241,9 +359,7 @@ class InventoryCollector:
         schema = "source_catalog STRING, source_database STRING, function_name_full STRING, function_desc STRING"
         results_df = self.spark.createDataFrame([], schema)
 
-        scan_catalog = 'hive_metastore'
-        self.spark.sql(f'use catalog {scan_catalog}')
-
+        self.setCatalog(scan_catalog)
         for db in self.spark.sql(f"SHOW DATABASES").collect():
             funcs = list_functions(scan_catalog, db.databaseName).collect()
             funcCount = len(funcs)
@@ -261,6 +377,7 @@ class InventoryCollector:
 
         # Save the results to a Delta table
         results_df = results_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))
+        self.setStorageCatalog()
         results_df.write.format("delta").mode("append").saveAsTable(f"{self.inventory_catdb}.db_functions")
         return results_df
 
@@ -286,7 +403,7 @@ class InventoryCollector:
         if nameOnly:
             return tableName
         else:
-            self.tryUseCatalog()
+            self.setStorageCatalog()
             return self.spark.table(tableName)
         
     def get_results_by_execution_id(self, execution_id, data_type=None):
@@ -311,15 +428,13 @@ class InventoryCollector:
         data_df = self.get_result_table(data_type)
         return data_df.filter(data_df["inventory_execution_id"] == execution_id)
 
-    def get_last_execution_id(self, data_type="grants", database_name=None):
+    def get_last_execution_id(self, data_type="grants", catalog_name = "hive_metastore", database_name=None):
         table_name = self.get_result_table(data_type, nameOnly=True)
-        
+        where_clause = f"WHERE source_catalog = '{catalog_name}'"
         if database_name:
-            where_clause = f"WHERE source_database = '{database_name}'"
-        else:
-            where_clause = ""
+            where_clause = where_clause + f" AND source_database = '{database_name}'"
     
-        self.tryUseCatalog()
+        self.setStorageCatalog()
         try:
             latest_execution_id = self.spark.sql(f"""
                 SELECT inventory_execution_id
@@ -336,9 +451,9 @@ class InventoryCollector:
         
         return latest_execution_id
 
-    def get_all_latest_executions(self, data_type="grants"):
+    def get_all_latest_executions(self, data_type="grants", whichCatalog = 'hive_metastore'):
         table_name = self.get_result_table(data_type, nameOnly=True)
-        self.tryUseCatalog()
+        self.setStorageCatalog()
         # Group by source_database and return the last execution id for every source_database
         latest_execution_df = self.spark.sql(f"""
             SELECT DISTINCT source_database, inventory_execution_id, execution_time
@@ -346,6 +461,7 @@ class InventoryCollector:
                 SELECT source_database, inventory_execution_id, execution_time,
                     ROW_NUMBER() OVER (PARTITION BY source_database ORDER BY execution_time DESC) as row_num
                     FROM {table_name}
+                    WHERE source_catalog = '{whichCatalog}'
             ) ranked_data
             WHERE row_num = 1
         """)
@@ -358,7 +474,7 @@ class InventoryCollector:
         return self.get_results_by_execution_id(exec_id)
 
     def get_execution_history(self, data_type=None):
-        self.tryUseCatalog()
+        self.setStorageCatalog()
         if data_type is None:
             # Get execution history for both grants and objects, and union the results
             grants_history = self.get_execution_history(data_type="grants")
@@ -368,23 +484,23 @@ class InventoryCollector:
             # Execute the SQL query for the specified data_type and return the result
             table_name = self.get_result_table(data_type, nameOnly=True)
             execution_history = self.spark.sql(f"""
-                SELECT DISTINCT inventory_execution_id, execution_time, source_database
+                SELECT DISTINCT inventory_execution_id, execution_time, source_catalog, source_database
                 FROM {table_name}
                 ORDER BY execution_time DESC
             """).withColumn('data_type', lit(data_type))
     
         return execution_history
 
-    def get_database_inventory_summary(self):
+    def get_database_inventory_summary(self, whichCatalog):
         # Get the latest grant executions for each database
-        latest_grant_executions = self.get_all_latest_executions(data_type="grants")
+        latest_grant_executions = self.get_all_latest_executions(data_type="grants", whichCatalog=whichCatalog)
         latest_grant_executions = latest_grant_executions.withColumnRenamed("source_database", "database")
         latest_grant_executions = latest_grant_executions.withColumnRenamed("inventory_execution_id", "grant_last_execution_id")
         latest_grant_executions = latest_grant_executions.withColumnRenamed("execution_time", "grant_last_execution_time")
         latest_grant_executions = latest_grant_executions.drop("data_type")
 
         # Get the latest object inventory executions for each database
-        latest_object_executions = self.get_all_latest_executions(data_type="objects")
+        latest_object_executions = self.get_all_latest_executions(data_type="objects", whichCatalog=whichCatalog)
         latest_object_executions = latest_object_executions.withColumnRenamed("source_database", "database")
         latest_object_executions = latest_object_executions.withColumnRenamed("inventory_execution_id", "object_last_execution_id")
         latest_object_executions = latest_object_executions.withColumnRenamed("execution_time", "object_last_execution_time")
@@ -398,14 +514,14 @@ class InventoryCollector:
         #                                 "object_last_execution_id": "", "object_last_execution_time": ""})
     
         # Add object counts for each database
-        object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").groupBy("inventory_execution_id", "source_database", "objectType").count()
+        object_counts = self.spark.table(f"{self.inventory_catdb}.db_objects").filter(col("source_catalog") == lit(whichCatalog)).groupBy("inventory_execution_id", "source_database", "objectType").count()
         object_counts = object_counts.withColumnRenamed("inventory_execution_id", "object_last_execution_id")
         object_counts = object_counts.groupBy("object_last_execution_id").pivot("objectType").agg(first("count"))
         object_counts = object_counts.fillna(0)
         summary_df = summary_df.join(object_counts, on=["object_last_execution_id"], how="left")
     
         # Add grant count for each database
-        grant_counts = self.spark.table(f"{self.inventory_catdb}.grant_statements").groupBy("inventory_execution_id", "source_database").count()
+        grant_counts = self.spark.table(f"{self.inventory_catdb}.grant_statements").filter(col("source_catalog") == lit(whichCatalog)).groupBy("inventory_execution_id", "source_database").count()
         grant_counts = grant_counts.withColumnRenamed("source_database", "database") # Needed?
         grant_counts = grant_counts.withColumnRenamed("count", "grant_count")
         grant_counts = grant_counts.withColumnRenamed("inventory_execution_id", "grant_last_execution_id")
@@ -416,12 +532,11 @@ class InventoryCollector:
         return summary_df
 
         
-    def scan_all_databases(self, rescan=False):
-        self.tryUseCatalog()
-
+    def scan_all_databases(self, scanCatalog, rescan=False):
         if not rescan:
             print("First, scanning existing progress")
             # Generate exclusion list for grant_statements
+            self.setStorageCatalog()
             grant_db_list = self.get_result_table('grants').select("source_database").distinct().collect()
             grant_db_list = [row["source_database"] for row in grant_db_list]
 
@@ -433,6 +548,7 @@ class InventoryCollector:
             object_db_list = []
 
         # Get a list of all databases
+        self.setCatalog(scanCatalog)
         all_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
         
         for database_name in all_databases:
@@ -443,12 +559,12 @@ class InventoryCollector:
 
             # Scan database objects
             if database_name not in object_db_list:
-                (object_exec_id, object_df) = self.scan_database_objects(database_name)
+                (object_exec_id, object_df) = self.scan_database_objects(scanCatalog, database_name)
                 print(f"Finished scanning objects for {database_name}. Execution ID: {object_exec_id}")
 
             # Scan database grants
             if database_name not in grant_db_list:
-                (grant_exec_id, grant_df) = self.scan_database_grants(database_name)
+                (grant_exec_id, grant_df) = self.scan_database_grants(scanCatalog, database_name)
                 print(f"Finished scanning grants for {database_name}. Execution ID: {grant_exec_id}")        
         
         print("Finished scanning all databases")
@@ -716,12 +832,11 @@ class InventoryCollector:
     # End generate grant migration DDL
 
     
-    def generate_migration_ddl(self, whichDatabase, destCatalog, forceRescan = False):
-
+    def generate_migration_ddl(self, whichDatabase, sourceCatalog, destCatalog, forceRescan = False):
         #Pull object Data & Generate
-        objectDF = None if forceRescan else self.get_last_results('objects', whichDatabase);
+        objectDF = None if forceRescan else self.get_last_results('objects', sourceCatalog, whichDatabase)
         if objectDF is None:
-            _, objectDF = self.scan_database_objects(whichDatabase)
+            _, objectDF = self.scan_database_objects(sourceCatalog, whichDatabase)
 
         if objectDF is not None:
             ddl_object = self.generate_migration_object_sql(objectDF, destCatalog)
@@ -730,12 +845,12 @@ class InventoryCollector:
             ddl_object is None
 
         #Pull Grant Data & Generate
-        grantDF = None if forceRescan else self.get_last_results('grants', whichDatabase)
+        grantDF = None if forceRescan else self.get_last_results('grants', sourceCatalog, whichDatabase)
         if grantDF is None:
-            _, grantDF = self.scan_database_grants(whichDatabase)
+            _, grantDF = self.scan_database_grants(sourceCatalog, whichDatabase)
 
         if grantDF is not None:
-            print(f"Generating Grant DDL to migrate from hive_metastore.{whichDatabase} to {destCatalog}.{whichDatabase}")
+            print(f"Generating Grant DDL to migrate from {sourceCatalog}.{whichDatabase} to {destCatalog}.{whichDatabase}")
             ddl_grants = self.generate_migration_grant_sql(grantDF, destCatalog)
         else:
             print("WARNING: No Grants to generate DDL for")
