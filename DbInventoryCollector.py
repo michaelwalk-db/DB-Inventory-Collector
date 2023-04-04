@@ -277,7 +277,7 @@ class InventoryCollector:
         quotedDbName = f'`{database_name}`'
         # append the database df to the list
         databaseGrants = ( self.spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
-                                    .filter(col("ObjectType")=="DATABASE")
+                                    .filter('ObjectType == "DATABASE" OR ObjectType == "SCHEMA"')
                                     .withColumn("ObjectKey", lit(quotedDbName))
                                     .withColumn("ObjectType", lit("DATABASE"))
                                     # .filter(col("ActionType")!="OWN")
@@ -832,11 +832,11 @@ class InventoryCollector:
     # End generate grant migration DDL
 
     
-    def generate_migration_ddl(self, whichDatabase, sourceCatalog, destCatalog, forceRescan = False):
+    def generate_migration_ddl(self, sourceCatalog, sourceDatabase, destCatalog, forceRescan = False):
         #Pull object Data & Generate
-        objectDF = None if forceRescan else self.get_last_results('objects', sourceCatalog, whichDatabase)
+        objectDF = None if forceRescan else self.get_last_results('objects', sourceCatalog, sourceDatabase)
         if objectDF is None:
-            _, objectDF = self.scan_database_objects(sourceCatalog, whichDatabase)
+            _, objectDF = self.scan_database_objects(sourceCatalog, sourceDatabase)
 
         if objectDF is not None:
             ddl_object = self.generate_migration_object_sql(objectDF, destCatalog)
@@ -845,12 +845,12 @@ class InventoryCollector:
             ddl_object is None
 
         #Pull Grant Data & Generate
-        grantDF = None if forceRescan else self.get_last_results('grants', sourceCatalog, whichDatabase)
+        grantDF = None if forceRescan else self.get_last_results('grants', sourceCatalog, sourceDatabase)
         if grantDF is None:
-            _, grantDF = self.scan_database_grants(sourceCatalog, whichDatabase)
+            _, grantDF = self.scan_database_grants(sourceCatalog, sourceDatabase)
 
         if grantDF is not None:
-            print(f"Generating Grant DDL to migrate from {sourceCatalog}.{whichDatabase} to {destCatalog}.{whichDatabase}")
+            print(f"Generating Grant DDL to migrate from {sourceCatalog}.{sourceDatabase} to {destCatalog}.{sourceDatabase}")
             ddl_grants = self.generate_migration_grant_sql(grantDF, destCatalog)
         else:
             print("WARNING: No Grants to generate DDL for")
@@ -873,7 +873,7 @@ class InventoryCollector:
         return '\n'.join([x.strip() for x in sqlStatement.split('\n') if not x.strip().startswith('--') and x.strip()])
 
     def execute_sql_list(self, sql_list, echo=True):
-        for statementRaw in self.ddl_object_array:
+        for statementRaw in sql_list:
             if statementRaw == '': continue
             statementClean = self.strip_sql_comments(statementRaw)
             if statementClean == '': continue           
