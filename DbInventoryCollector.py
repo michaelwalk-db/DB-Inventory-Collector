@@ -532,38 +532,48 @@ class InventoryCollector:
         return summary_df
 
         
-    def scan_all_databases(self, scanCatalog, rescan=False):
+    def scan_all_databases(self, scanCatalog, rescan=False, scanObjects = True, scanGrants = True, databaseScanList = None):
+        if not scanObjects and not scanGrants:
+            print("WARNING: Neither scanObjects nor scanGrants requested. Doing nothing.")
+            return
+        
+        grant_db_list = []
+        object_db_list = []
+        
         if not rescan:
             print("First, scanning existing progress")
-            # Generate exclusion list for grant_statements
             self.setStorageCatalog()
-            grant_db_list = self.get_result_table('grants').select("source_database").distinct().collect()
-            grant_db_list = [row["source_database"] for row in grant_db_list]
-
             # Generate exclusion list for db_objects
-            object_db_list = self.get_result_table('objects').select("source_database").distinct().collect()
-            object_db_list = [row["source_database"] for row in object_db_list]
-        else:
-            grant_db_list = []
-            object_db_list = []
+            if scanObjects:
+                object_db_list = self.get_result_table('objects').select("source_database").distinct().collect()
+                object_db_list = [row["source_database"] for row in object_db_list]
 
-        # Get a list of all databases
+            # Generate exclusion list for grant_statements
+            if scanGrants:
+                grant_db_list = self.get_result_table('grants').select("source_database").distinct().collect()
+                grant_db_list = [row["source_database"] for row in grant_db_list]
+            
+
+        # Get a list of databases to scan
         self.setCatalog(scanCatalog)
-        all_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
-        
-        for database_name in all_databases:
+        scan_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
+        if databaseScanList is not None:
+            scan_databases = [db for db in scan_databases if db in databaseScanList]
+            print(f"databaseFilterList list present. Will only scan: {scan_databases}")
+
+        for database_name in scan_databases:
             # Skip databases that have already been scanned and have data in the inventory
             if not rescan and database_name in grant_db_list and database_name in object_db_list:
                 print(f"Skipping database {database_name} as it has already been scanned and has data in the inventory.")
                 continue
 
             # Scan database objects
-            if database_name not in object_db_list:
+            if scanObjects and database_name not in object_db_list:
                 (object_exec_id, object_df) = self.scan_database_objects(scanCatalog, database_name)
                 print(f"Finished scanning objects for {database_name}. Execution ID: {object_exec_id}")
 
             # Scan database grants
-            if database_name not in grant_db_list:
+            if scanGrants and database_name not in grant_db_list:
                 (grant_exec_id, grant_df) = self.scan_database_grants(scanCatalog, database_name)
                 print(f"Finished scanning grants for {database_name}. Execution ID: {grant_exec_id}")        
         
