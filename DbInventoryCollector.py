@@ -786,7 +786,7 @@ class InventoryCollector:
         ("DATABASE", "CREATE"): "CREATE_TABLE",
         ("DATABASE", "CREATE_NAMED_FUNCTION"): "CREATE_FUNCTION",
         ("DATABASE", "SELECT"): "SELECT",
-        ("DATABASE", "MODIFY"): "SELECT",
+        ("DATABASE", "MODIFY"): "MODIFY",
         ("DATABASE", "OWN"): "ALTER",
         ("DATABASE", "READ_METADATA"): "IGNORE",
     }
@@ -815,8 +815,12 @@ class InventoryCollector:
 
             new_action = self.hive_to_uc_privilege_map.get((object_type, action_type), None)
 
-            if new_action is None or new_action == "IGNORE":
-                print(f"Note: Skipping migration of GRANT action {action_type} on type {object_type} to {principal} -- not used in UC")
+            if new_action is None:
+                print(f"WARNING: Skipping migration of UNRECOGNIZED GRANT action {action_type} on type {object_type} to {principal} -- not used in UC")
+                continue
+            elif new_action == "IGNORE":
+                #Just silently ignore these.
+                #print(f"Note: Skipping migration of GRANT action {action_type} on type {object_type} to {principal} -- not used in UC")
                 continue
             elif new_action == "ALTER":
                 #https://docs.databricks.com/data-governance/unity-catalog/manage-privileges/ownership.html
