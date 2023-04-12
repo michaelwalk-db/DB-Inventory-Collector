@@ -61,7 +61,7 @@ class InventoryCollector:
     GRANT_EXECUTION_ID_PREFIX = "grants-"
     FUNCTION_EXECUTION_ID_PREFIX = "func_meta-"
 
-    def __init__(self, spark, inventory_catalog, inventory_database):
+    def __init__(self, spark, inventory_catalog, inventory_database, numThreads = 8):
         """
         Initialize the InventoryCollector class with the required parameters.
 
@@ -73,6 +73,7 @@ class InventoryCollector:
         self.spark = spark
         self.inventory_catalog = inventory_catalog
         self.inventory_database = inventory_database
+        self.numThreads = numThreads
         
         if self.inventory_catalog == 'hive_metastore':
             self.inventory_catdb = f"`{self.inventory_database}`" #Will have to rely on tryUse Catalog to ensure this works
@@ -261,6 +262,8 @@ class InventoryCollector:
         #Record finished (this also prints)
         self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "objects", len(object_rows))
         
+        print(f"Finished scanning objects for {database_name}. Found {len(object_rows)} objects. Execution ID: {execution_id}")
+
         return (execution_id, object_df)
     
     def scan_database_grants(self, scanCatalog, database_name):
@@ -292,18 +295,19 @@ class InventoryCollector:
             table_name = table_view["tableName"]
             table_fullname = f'`{database_name}`.`{table_view.tableName}`'
         
-            tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
-                            .filter(col("ObjectType")=="TABLE")
-                            .withColumn("ObjectKey", lit(table_fullname))
-                            .withColumn("ObjectType", lit("TABLE"))
-                            .collect()
-                        )
-            # tableGrants Schema:
-            # Principal, ActionType, ObjectType, ObjectKey
-
-            # Add to combined list
-            processed_acl.update(tableGrants)
-        
+            try:
+                tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
+                                .filter(col("ObjectType")=="TABLE")
+                                .withColumn("ObjectKey", lit(table_fullname))
+                                .withColumn("ObjectType", lit("TABLE"))
+                                .collect()
+                            )
+                # tableGrants Schema:
+                # Principal, ActionType, ObjectType, ObjectKey
+            except Exception as e:
+                print(f"ERROR scanning grants for table {table_name}. ErrorMessage: {e}")
+            else:
+                processed_acl.update(tableGrants)
             
         # If there are no grants in the database, return early
         numGrants = len(processed_acl)
@@ -339,6 +343,9 @@ class InventoryCollector:
 
         #Record finished (this also prints)
         self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "grants", numGrants)
+        
+        print(f"Finished scanning grants for {database_name}. Found {numGrants} objects. Execution ID: {execution_id}")
+
         return (execution_id, acl_df)
 
     def scan_catalog_functions(self, scan_catalog):
@@ -557,25 +564,34 @@ class InventoryCollector:
         # Get a list of databases to scan
         self.setCatalog(scanCatalog)
         scan_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
+        
+        #Exclude system tables
+        ignore_databases = ['information_schema']
+        scan_databases = [db for db in scan_databases if db not in ignore_databases]
+        
         if databaseScanList is not None:
             scan_databases = [db for db in scan_databases if db in databaseScanList]
             print(f"databaseFilterList list present. Will only scan: {scan_databases}")
 
-        for database_name in scan_databases:
-            # Skip databases that have already been scanned and have data in the inventory
-            if not rescan and database_name in grant_db_list and database_name in object_db_list:
-                print(f"Skipping database {database_name} as it has already been scanned and has data in the inventory.")
-                continue
+        #Create lists of databases to scan, taking into acount settings and past scans.
+        objectScanList = [] if not scanObjects else [database_name for database_name in scan_databases if database_name not in object_db_list or rescan]
+        grantScanList = [] if not scanGrants else [database_name for database_name in scan_databases if database_name not in grant_db_list or rescan]
 
-            # Scan database objects
-            if scanObjects and database_name not in object_db_list:
-                (object_exec_id, object_df) = self.scan_database_objects(scanCatalog, database_name)
-                print(f"Finished scanning objects for {database_name}. Execution ID: {object_exec_id}")
+        # Print the message for databases that will be skipped.
+        if not rescan:
+            for database_name in scan_databases:
+                if database_name in grant_db_list and database_name in object_db_list:
+                    print(f"Skipping database {database_name} as it has already been scanned and has data in the inventory.")
 
-            # Scan database grants
-            if scanGrants and database_name not in grant_db_list:
-                (grant_exec_id, grant_df) = self.scan_database_grants(scanCatalog, database_name)
-                print(f"Finished scanning grants for {database_name}. Execution ID: {grant_exec_id}")        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.numThreads) as executor:
+          futures_objects = [executor.submit(self.scan_database_objects, scanCatalog, databaseName) for databaseName in objectScanList]
+          futures_grants = [executor.submit(self.scan_database_grants, scanCatalog, databaseName) for databaseName in grantScanList]
+          
+          #await both futures_objects and futures_grants, printing the ids as completed
+          futures_all = futures_objects + futures_grants
+          for future in concurrent.futures.as_completed(futures_all):
+              result = future.result()
+              print(f"Recieved async result with id: {result[0]}")       
         
         print("Finished scanning all databases")
 
