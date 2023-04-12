@@ -61,7 +61,7 @@ class InventoryCollector:
     GRANT_EXECUTION_ID_PREFIX = "grants-"
     FUNCTION_EXECUTION_ID_PREFIX = "func_meta-"
 
-    def __init__(self, spark, inventory_catalog, inventory_database, numThreads = 8):
+    def __init__(self, spark, inventory_catalog, inventory_database, numThreads = 16):
         """
         Initialize the InventoryCollector class with the required parameters.
 
@@ -74,30 +74,39 @@ class InventoryCollector:
         self.inventory_catalog = inventory_catalog
         self.inventory_database = inventory_database
         self.numThreads = numThreads
-        
-        if self.inventory_catalog == 'hive_metastore':
-            self.inventory_catdb = f"`{self.inventory_database}`" #Will have to rely on tryUse Catalog to ensure this works
-            self.inventory_destHms = True
-        else:
-            self.inventory_catdb = f"`{self.inventory_catalog}`.`{self.inventory_database}`"
-            self.inventory_destHms = False
-
-    def setCatalog(self, catalogName):
-        if catalogName == 'hive_metastore':
-            try:
-                self.spark.sql(f'USE CATALOG {catalogName};')
-            except Exception as e:
-                pass #Probably just not on UC enabled cluster, so just ignore
-        else:
-            #No try, this is important
-            self.spark.sql(f'USE CATALOG {catalogName};')
+        self.uc_enabled = False #to be set later
             
-    def setStorageCatalog(self):
-        self.setCatalog(self.inventory_catalog)
+    def getScanCatDb(self, catalogName, databaseName):
+        if self.uc_enabled:
+            return f"`{catalogName}`.`{databaseName}`"
+        else:
+            return f"`{databaseName}`"
+    
+    #uc enabled hack
+    def runShowDatabases(self, showCatalog = None):
+        if (showCatalog is not None) and self.uc_enabled:
+            showDbQuery = f"SHOW DATABASES IN {showCatalog}"
+        else:
+            showDbQuery = "SHOW DATABASES"
+        return self.spark.sql(showDbQuery)
 
     def initialize(self):
-        print(f'Will save results to: {self.inventory_catdb}. {("Saving to HMS" if self.inventory_destHms else "Saving to UC Catalog")}')
-        self.setStorageCatalog()
+        self.uc_enabled = True
+        #Detect if we're connected to uc
+        catalogList = [r.catalog for r in self.spark.sql("show catalogs").collect()]
+        if len(catalogList) == 1 and catalogList[0] == "spark_catalog":
+            print("Not connected to UC cluster. This is OK if you're only scanning hive_metastore")
+            self.uc_enabled = False
+            if(self.inventory_catalog.lower() != 'hive_metastore'):
+                raise Exception("Not saving data to hive_metastore and not connected to UC cluster")
+        
+        if self.uc_enabled:
+            self.inventory_catdb = f"`{self.inventory_catalog}`.`{self.inventory_database}`"
+        else:
+            self.inventory_catdb = f"`{self.inventory_database}`" #Will have to rely on tryUse Catalog to ensure this works
+
+        print(f'Will save results to: {self.inventory_catdb}. {("UC Enabled" if self.uc_enabled else "Non-UC Cluster")}')
+        
         self.spark.sql(f'CREATE DATABASE IF NOT EXISTS {self.inventory_catdb}')
 
         self.spark.sql(f"""
@@ -204,7 +213,7 @@ class InventoryCollector:
             [(execution_id, execution_time, catalog_name, database_name, data_type, time_elapsed, records_written)],
             schema=schema
         )
-        self.setStorageCatalog()
+        
         execution_record.write.mode("append").saveAsTable(f"{self.inventory_catdb}.execution_history")
         print(f"{end_time} - Finished {data_type.upper()} inventory of database {catalog_name}.{database_name} execution_id: {execution_id}. Elapsed: {time_elapsed}s")
 
@@ -225,15 +234,15 @@ class InventoryCollector:
         ])
         object_rows = set()
 
-        self.setCatalog(scanCatalog)
-        
-        tables = self.spark.sql(f"SHOW TABLES IN {database_name}").filter(col("isTemporary") == False).collect()
-        print(f"{database_name} has {len(tables)} objects")
+        scanCatDb = self.getScanCatDb(scanCatalog, database_name)
+
+        tables = self.spark.sql(f"SHOW TABLES IN {scanCatDb}").filter(col("isTemporary") == False).collect()
+        print(f"{scanCatDb} has {len(tables)} objects")
 
         for table in tables:
             table_name = table.tableName
             try:
-                desc_result = self.spark.sql(f"DESCRIBE TABLE EXTENDED {database_name}.{table_name};")
+                desc_result = self.spark.sql(f"DESCRIBE TABLE EXTENDED {scanCatDb}.{table_name};")
 
                 object_type = desc_result.filter('col_name = "Type"').select("data_type").collect()[-1].data_type
 
@@ -243,18 +252,18 @@ class InventoryCollector:
                 view_text = desc_result.filter('col_name = "View Text"').select("data_type").collect()[-1].data_type if object_type == 'VIEW' else "n/a"
 
             except Exception as e2:
-                print(f" TABLE: {database_name}.{table_name} -- ERROR RETRIEVING DETAILS:\nERROR MSG: {str(e2)}")
+                print(f" TABLE: {scanCatDb}.{table_name} -- ERROR RETRIEVING DETAILS:\nERROR MSG: {str(e2)}")
                 object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType="ERROR", location=None, viewText=None, errMsg=str(e2)))
                 continue
 
-            print(f" TABLE: {database_name}.{table_name} -- TYPE: {object_type}")
+            print(f" TABLE: {scanCatDb}.{table_name} -- TYPE: {object_type}")
             object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
 
         #Create object DF and write to db_objects table
         if len(object_rows) > 0:
             object_df = self.spark.createDataFrame(object_rows, objTableSchema)
             object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))        
-            self.setStorageCatalog()
+            
             object_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.db_objects")
         else:
             object_df = None
@@ -262,7 +271,7 @@ class InventoryCollector:
         #Record finished (this also prints)
         self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "objects", len(object_rows))
         
-        print(f"Finished scanning objects for {database_name}. Found {len(object_rows)} objects. Execution ID: {execution_id}")
+        print(f"Finished scanning objects for {scanCatDb}. Found {len(object_rows)} objects. Execution ID: {execution_id}")
 
         return (execution_id, object_df)
     
@@ -270,16 +279,17 @@ class InventoryCollector:
         # Create a random execution ID and get the current timestamp
         execution_id = self.GRANT_EXECUTION_ID_PREFIX + str(uuid.uuid4())
         execution_time = datetime.now()
-        print(f"{execution_time} - Start 'grants' inventory of database {database_name}. Creating inventory_execution_id: {execution_id}")
+
+        # Set DB Names
+        quotedDbName = f'`{database_name}`'        
+        scanCatDb = self.getScanCatDb(scanCatalog, database_name)
+
+
+        print(f"{execution_time} - Start 'grants' inventory of database {scanCatDb}. Creating inventory_execution_id: {execution_id}")
         processed_acl = set()
     
-        # Set the current database
-        self.setCatalog(scanCatalog)
-        self.spark.sql(f"USE {database_name}")
-
-        quotedDbName = f'`{database_name}`'
         # append the database df to the list
-        databaseGrants = ( self.spark.sql(f"SHOW GRANT ON DATABASE {database_name}")
+        databaseGrants = ( self.spark.sql(f"SHOW GRANTS ON DATABASE {scanCatDb}")
                                     .filter('ObjectType == "DATABASE" OR ObjectType == "SCHEMA"')
                                     .withColumn("ObjectKey", lit(quotedDbName))
                                     .withColumn("ObjectType", lit("DATABASE"))
@@ -288,24 +298,25 @@ class InventoryCollector:
         processed_acl.update(databaseGrants.collect())
 
         # Get the list of tables and views
-        tables_and_views = self.spark.sql(f"SHOW TABLES in {database_name}").filter(col("isTemporary") == False).collect()
+        tables_and_views = self.spark.sql(f"SHOW TABLES in {scanCatDb}").filter(col("isTemporary") == False).collect()
     
         # Iterate over tables and views
         for table_view in tables_and_views:
-            table_name = table_view["tableName"]
-            table_fullname = f'`{database_name}`.`{table_view.tableName}`'
+            table_name = table_view.tableName
+            table_name2 = f'`{database_name}`.`{table_name}`'
+            table_name3 = f'{scanCatDb}.`{table_name}`'
         
             try:
-                tableGrants = (self.spark.sql(f"SHOW GRANT ON TABLE {table_name}")
+                tableGrants = (self.spark.sql(f"SHOW GRANTS ON TABLE {table_name3}")
                                 .filter(col("ObjectType")=="TABLE")
-                                .withColumn("ObjectKey", lit(table_fullname))
+                                .withColumn("ObjectKey", lit(table_name2))
                                 .withColumn("ObjectType", lit("TABLE"))
                                 .collect()
                             )
                 # tableGrants Schema:
                 # Principal, ActionType, ObjectType, ObjectKey
             except Exception as e:
-                print(f"ERROR scanning grants for table {table_name}. ErrorMessage: {e}")
+                print(f"ERROR scanning grants for table {table_name3}. ErrorMessage: {e}")
             else:
                 processed_acl.update(tableGrants)
             
@@ -335,7 +346,7 @@ class InventoryCollector:
                 )
             )
 
-            self.setStorageCatalog()
+            
             acl_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.grant_statements")
             print(f"{datetime.now()} - Finished writing {len(processed_acl)} results for database {database_name}. {execution_id}.")
         else:
@@ -344,7 +355,7 @@ class InventoryCollector:
         #Record finished (this also prints)
         self.write_execution_record(execution_id, execution_time, scanCatalog, database_name, "grants", numGrants)
         
-        print(f"Finished scanning grants for {database_name}. Found {numGrants} objects. Execution ID: {execution_id}")
+        print(f"Finished scanning grants for {scanCatDb}. Found {numGrants} objects. Execution ID: {execution_id}")
 
         return (execution_id, acl_df)
 
@@ -366,8 +377,7 @@ class InventoryCollector:
         schema = "source_catalog STRING, source_database STRING, function_name_full STRING, function_desc STRING"
         results_df = self.spark.createDataFrame([], schema)
 
-        self.setCatalog(scan_catalog)
-        for db in self.spark.sql(f"SHOW DATABASES").collect():
+        for db in self.runShowDatabases(scan_catalog).collect():
             funcs = list_functions(scan_catalog, db.databaseName).collect()
             funcCount = len(funcs)
             if funcCount > 0: 
@@ -384,7 +394,7 @@ class InventoryCollector:
 
         # Save the results to a Delta table
         results_df = results_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))
-        self.setStorageCatalog()
+        
         results_df.write.format("delta").mode("append").saveAsTable(f"{self.inventory_catdb}.db_functions")
         return results_df
 
@@ -410,7 +420,7 @@ class InventoryCollector:
         if nameOnly:
             return tableName
         else:
-            self.setStorageCatalog()
+            
             return self.spark.table(tableName)
         
     def get_results_by_execution_id(self, execution_id, data_type=None):
@@ -441,7 +451,7 @@ class InventoryCollector:
         if database_name:
             where_clause = where_clause + f" AND source_database = '{database_name}'"
     
-        self.setStorageCatalog()
+        
         try:
             latest_execution_id = self.spark.sql(f"""
                 SELECT inventory_execution_id
@@ -460,7 +470,7 @@ class InventoryCollector:
 
     def get_all_latest_executions(self, data_type="grants", whichCatalog = 'hive_metastore'):
         table_name = self.get_result_table(data_type, nameOnly=True)
-        self.setStorageCatalog()
+        
         # Group by source_database and return the last execution id for every source_database
         latest_execution_df = self.spark.sql(f"""
             SELECT DISTINCT source_database, inventory_execution_id, execution_time
@@ -481,7 +491,7 @@ class InventoryCollector:
         return self.get_results_by_execution_id(exec_id)
 
     def get_execution_history(self, data_type=None):
-        self.setStorageCatalog()
+        
         if data_type is None:
             # Get execution history for both grants and objects, and union the results
             grants_history = self.get_execution_history(data_type="grants")
@@ -549,7 +559,7 @@ class InventoryCollector:
         
         if not rescan:
             print("First, scanning existing progress")
-            self.setStorageCatalog()
+            
             # Generate exclusion list for db_objects
             if scanObjects:
                 object_db_list = self.get_result_table('objects').select("source_database").distinct().collect()
@@ -562,8 +572,7 @@ class InventoryCollector:
             
 
         # Get a list of databases to scan
-        self.setCatalog(scanCatalog)
-        scan_databases = [db["databaseName"] for db in self.spark.sql("SHOW DATABASES").select("databaseName").collect()]
+        scan_databases = [db["databaseName"] for db in self.runShowDatabases(scanCatalog).select("databaseName").collect()]
         
         #Exclude system tables
         ignore_databases = ['information_schema']
