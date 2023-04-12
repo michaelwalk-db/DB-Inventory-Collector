@@ -4,7 +4,7 @@
 # These imports are used
 from pyspark.sql import *
 from pyspark.sql.functions import *
-from pyspark.sql.types import StructType,StructField, StringType, IntegerType, TimestampType, FloatType
+from pyspark.sql.types import *
 import uuid
 from datetime import datetime, timedelta
 
@@ -901,15 +901,43 @@ class InventoryCollector:
     @staticmethod
     def strip_sql_comments(sqlStatement):
         return '\n'.join([x.strip() for x in sqlStatement.split('\n') if not x.strip().startswith('--') and x.strip()])
-
+   
     def execute_sql_list(self, sql_list, echo=True):
+        # Define the schema for the results DataFrame
+        results_schema = StructType([
+            StructField("sql_execution_id", StringType(), True),
+            StructField("timestamp", TimestampType(), True),
+            StructField("statement", StringType(), True),
+            StructField("success", BooleanType(), True),
+            StructField("error_message", StringType(), True)
+        ])
+
+        # Initialize an empty DataFrame with the results schema
+        results_df = self.spark.createDataFrame([], schema=results_schema)
+        sql_execution_id = str(uuid.uuid4())
+
         for statementRaw in sql_list:
             if statementRaw == '': continue
             statementClean = self.strip_sql_comments(statementRaw)
-            if statementClean == '': continue           
+            if statementClean == '': continue
             if echo: print(f"Executing SQL:\n{statementClean}\n")
+
+            success = False
+            error_message = None
             try:
                 self.spark.sql(statementClean)
+                success = True
             except Exception as e:
-                print(e)
+                error_message = str(e)
+
+            current_timestamp = datetime.now()
+
+            # Append the result to the results DataFrame
+            result_row = self.spark.createDataFrame([(sql_execution_id, current_timestamp, statementClean, success, error_message)], schema=results_schema)
+            results_df = results_df.union(result_row)
+
+        # Write the results DataFrame to a Delta table
+        results_df.write.format("delta").mode("append").saveAsTable(f"{self.inventory_catdb}.migration_sql_history")
+
+        return results_df
 #End of class
