@@ -628,7 +628,6 @@ class InventoryCollector:
                 lit("');")
             )
         )
-        
         return df
     
     def _generate_ddl_managed(self, df: DataFrame, destCatalog: str) -> DataFrame:
@@ -651,7 +650,6 @@ class InventoryCollector:
                 lit(";")
             )
         )
-        
         return df
     
     def _generate_ddl_view(self, df: DataFrame, destCatalog: str) -> DataFrame:
@@ -683,7 +681,7 @@ class InventoryCollector:
     # TODO: Add call out for external locations referenced
     # https://docs.databricks.com/data-governance/unity-catalog/manage-external-locations-and-credentials.html#manage-external-locations&language-sql
 
-    def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str, includeManaged = True) -> DataFrame:
+    def generate_migration_object_sql(self, inventoryDf: DataFrame, destCatalog: str, includeManaged = True, externalToManaged = False) -> DataFrame:
         def collectSql(df, joinSep: str = '\n'):
             sqlList = [r.sql_ddl for r in df.select('sql_ddl').collect()]
             return (len(sqlList), joinSep.join(sqlList))
@@ -693,6 +691,9 @@ class InventoryCollector:
             print("Attention: Managed tables are INCLUDED. This will COPY the data.")
         else:
             print("Attention: Managed tables are EXCLUDED. View creation may fail.")
+
+        if externalToManaged:
+            print("Attention: EXTERNAL tables will be converted to MANGED. This will COPY the data.")
 
         # Filter input DataFrame by objectType and generate DDL for each type        
         createDbCommands = set()
@@ -714,7 +715,11 @@ class InventoryCollector:
             error_messages.append(f"-- ERROR: Error retrieving information for object in the source database '{source_db}' and table '{table_name}'.\n--        Error Message (1st line): {first_line_error}")            
 
         #Generate DDLs for non-error object types
-        df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
+        if externalToManaged:
+            df_external = self._generate_ddl_managed(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
+        else:
+            df_external = self._generate_ddl_external(inventoryDf.filter(inventoryDf["objectType"] == "EXTERNAL"), destCatalog)
+
         if includeManaged:
             df_managed = self._generate_ddl_managed(inventoryDf.filter(inventoryDf["objectType"] == "MANAGED"), destCatalog)
         df_view = self._generate_ddl_view(inventoryDf.filter(inventoryDf["objectType"] == "VIEW"), destCatalog)
@@ -938,6 +943,7 @@ class InventoryCollector:
                 success = True
             except Exception as e:
                 error_message = str(e)
+                print(error_message)
 
             current_timestamp = datetime.now()
 
