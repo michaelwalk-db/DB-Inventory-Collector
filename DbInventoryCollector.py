@@ -876,14 +876,14 @@ class InventoryCollector:
     # End generate grant migration DDL
 
     
-    def generate_migration_ddl(self, sourceCatalog, sourceDatabase, destCatalog, forceRescan = False):
+    def generate_migration_ddl(self, sourceCatalog, sourceDatabase, destCatalog, forceRescan = False, includeManaged = True, externalToManaged = False):
         #Pull object Data & Generate
         objectDF = None if forceRescan else self.get_last_results('objects', sourceCatalog, sourceDatabase)
         if objectDF is None:
             _, objectDF = self.scan_database_objects(sourceCatalog, sourceDatabase)
 
         if objectDF is not None:
-            ddl_object = self.generate_migration_object_sql(objectDF, destCatalog)
+            ddl_object = self.generate_migration_object_sql(objectDF, destCatalog, includeManaged = includeManaged, externalToManaged = externalToManaged)
         else:
             print("WARNING: No Objects to generate DDL for")
             ddl_object is None
