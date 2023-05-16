@@ -5,7 +5,7 @@ Collects grants from tables and views.
 This Python script provides a class InventoryCollector that scans a Spark environment for database objects and access control grants. It stores the results in two tables: db_objects and grant_statements.
 
 ##  Testing Note:
-Note: this has only been tested for performing the inventory on the hive_metastore. Performing inventory on a different UC catalog may have different behaviour.
+Note: this has only been tested on one particular client and the sets of objects they have there. Notably it does NOT handle migration of functions, or automatic determination of when to migrate external tables to managed tables, though that can be manually invoked on the class provided.
 
 
 # Usage
