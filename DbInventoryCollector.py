@@ -129,6 +129,7 @@ class InventoryCollector:
                 source_database STRING,
                 table STRING,
                 objectType STRING,
+                objectOwner STRING,
                 location STRING,
                 viewText STRING,
                 errMsg STRING,
@@ -249,6 +250,8 @@ class InventoryCollector:
                 object_location_raw = desc_result.filter('col_name = "Location"').select("data_type").collect()
                 object_location = object_location_raw[-1].data_type if len(object_location_raw) > 0 else "n/a"
 
+                object_owner = desc_result.filter('col_name = "Owner"').select("data_type").collect()
+
                 view_text = desc_result.filter('col_name = "View Text"').select("data_type").collect()[-1].data_type if object_type == 'VIEW' else "n/a"
 
             except Exception as e2:
@@ -257,7 +260,7 @@ class InventoryCollector:
                 continue
 
             print(f" TABLE: {scanCatDb}.{table_name} -- TYPE: {object_type}")
-            object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
+            object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectOwner = object_owner, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
 
         #Create object DF and write to db_objects table
         if len(object_rows) > 0:
