@@ -229,6 +229,7 @@ class InventoryCollector:
             StructField("source_database", StringType(), True),
             StructField("table", StringType(), True),
             StructField("objectType", StringType(), True),
+            StructField("objectOwner", StringType(), True),
             StructField("location", StringType(), True),
             StructField("viewText", StringType(), True),
             StructField("errMsg", StringType(), True)
@@ -250,24 +251,24 @@ class InventoryCollector:
                 object_location_raw = desc_result.filter('col_name = "Location"').select("data_type").collect()
                 object_location = object_location_raw[-1].data_type if len(object_location_raw) > 0 else "n/a"
 
-                object_owner = desc_result.filter('col_name = "Owner"').select("data_type").collect()
+                object_owner = desc_result.filter('col_name = "Owner"').select("data_type").collect()[-1].data_type
 
                 view_text = desc_result.filter('col_name = "View Text"').select("data_type").collect()[-1].data_type if object_type == 'VIEW' else "n/a"
 
             except Exception as e2:
                 print(f" TABLE: {scanCatDb}.{table_name} -- ERROR RETRIEVING DETAILS:\nERROR MSG: {str(e2)}")
-                object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType="ERROR", location=None, viewText=None, errMsg=str(e2)))
+                object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType="ERROR", objectOwner = None, location=None, viewText=None, errMsg=str(e2)))
                 continue
 
             print(f" TABLE: {scanCatDb}.{table_name} -- TYPE: {object_type}")
-            object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectOwner = object_owner, objectType=object_type, location=object_location, viewText=view_text, errMsg=None))
+            object_rows.add(Row(source_catalog=scanCatalog, database=database_name, table=table_name, objectType=object_type, objectOwner = object_owner, location=object_location, viewText=view_text, errMsg=None))
 
         #Create object DF and write to db_objects table
         if len(object_rows) > 0:
             object_df = self.spark.createDataFrame(object_rows, objTableSchema)
             object_df = object_df.withColumn("inventory_execution_id", lit(execution_id)).withColumn("execution_time", lit(execution_time))        
             
-            object_df.write.mode("append").saveAsTable(f"{self.inventory_catdb}.db_objects")
+            object_df.write.mode("append").option("mergeSchema", 'true').saveAsTable(f"{self.inventory_catdb}.db_objects")
         else:
             object_df = None
 
